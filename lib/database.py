@@ -153,14 +153,26 @@ GET_NEXT_LISTINGS_MODIFIED_SQL: Composed = SQL(
     """
 ).format(source=Placeholder("source"), limit=Placeholder("limit"))
 
+# Overwrite on conflict, don't skip. A re-scrape only happens when the finder saw
+# a newer `modified_at` than our `last_scraped_at`, i.e. the portal listing really
+# changed — so the fresh HTML is the one we want. DO NOTHING kept the original
+# capture forever, which made the whole re-scrape/re-extract chain a no-op:
+# extract re-ran on HTML from the first sighting.
 SET_RAW_DATA_SQL: Composed = SQL(
-    "INSERT INTO {schema}.{table} ({fields}) VALUES ({values}) ON CONFLICT ({conflict}) DO NOTHING"
+    "INSERT INTO {schema}.{table} ({fields}) VALUES ({values}) ON CONFLICT ({conflict}) DO UPDATE SET {updates}"
 ).format(
     schema=Identifier("fixnflip_v2"),
     table=Identifier("raw_data"),
     fields=SQL(", ").join([Identifier("property_id"), Identifier("html"), Identifier("json")]),
     values=SQL(", ").join([Placeholder("property_id"), Placeholder("html"), Placeholder("json")]),
     conflict=Identifier("property_id"),
+    updates=SQL(", ").join(
+        [
+            SQL("{0} = EXCLUDED.{0}").format(Identifier("html")),
+            SQL("{0} = EXCLUDED.{0}").format(Identifier("json")),
+            SQL("{0} = now()").format(Identifier("fetched_at")),
+        ]
+    ),
 )
 
 SET_IMAGE_URLS_SQL: Composed = SQL(
@@ -215,6 +227,34 @@ DELETE_LISTING_SQL = SQL(
 ).format(
     property_table=Identifier("fixnflip_v2", "property"),
     system_table=Identifier("fixnflip_v2", "system"),
+)
+
+
+COUNT_STALE_LISTINGS_SQL: Composed = SQL(
+    """
+    SELECT count(*) FILTER (WHERE s.last_seen_at < now() - %(max_age)s::interval) AS stale,
+           count(*) AS active
+    FROM fixnflip_v2.property p
+    JOIN fixnflip_v2.system s ON s.property_id = p.id
+    LEFT JOIN fixnflip_v2.general g ON g.property_id = p.id
+    WHERE p.source = %(source)s
+        AND (g.active = TRUE OR g.active IS NULL)
+        AND s.last_seen_at IS NOT NULL
+    """
+)
+
+EXPIRE_STALE_LISTINGS_SQL: Composed = SQL(
+    """
+    UPDATE fixnflip_v2.general g
+    SET active = FALSE
+    FROM fixnflip_v2.property p
+    JOIN fixnflip_v2.system s ON s.property_id = p.id
+    WHERE g.property_id = p.id
+        AND p.source = %(source)s
+        AND (g.active = TRUE OR g.active IS NULL)
+        AND s.last_seen_at IS NOT NULL
+        AND s.last_seen_at < now() - %(max_age)s::interval
+    """
 )
 
 
@@ -420,6 +460,37 @@ class Database:
             cursor.execute(DELETE_LISTING_SQL, {"property_id": uuid})
             connection.commit()
             self.logger.debug(f"Listing {uuid} deleted")
+
+    @db_operation_with_retry
+    def count_stale_listings(self, source: ListingSource, max_age_days: int) -> tuple[int, int]:
+        """(stale, active) for one source. Stale = active but not seen by the
+        finder in max_age_days."""
+        with self._db() as (_, cursor):
+            cursor.execute(
+                COUNT_STALE_LISTINGS_SQL,
+                {"source": source.value, "max_age": f"{max_age_days} days"},
+            )
+            row = cursor.fetchone()
+            return (row["stale"], row["active"]) if row else (0, 0)
+
+    @db_operation_with_retry
+    def expire_stale_listings(self, source: ListingSource, max_age_days: int) -> int:
+        """Mark listings inactive that the finder has not seen in max_age_days.
+
+        `last_seen_at` is only meaningful once the weekly sweep runs, because the
+        incremental finder stops after a few pages and never reaches the older
+        listings. Callers must therefore check the sweep actually completed before
+        calling this — see expire.py, which refuses on an implausible share.
+        """
+        with self._db() as (connection, cursor):
+            cursor.execute(
+                EXPIRE_STALE_LISTINGS_SQL,
+                {"source": source.value, "max_age": f"{max_age_days} days"},
+            )
+            expired = cursor.rowcount
+            connection.commit()
+            self.logger.info(f"Expired {expired} {source.value} listings not seen in {max_age_days} days")
+            return expired
 
     @db_operation_with_retry
     def update_extra_data(self, uuid: UUID, extra_data: dict[str, dict[str, Any]]) -> None:

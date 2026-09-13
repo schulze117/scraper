@@ -1,3 +1,4 @@
+import argparse
 import concurrent.futures
 import sys
 from abc import ABC, abstractmethod
@@ -27,6 +28,10 @@ class BaseFinder(ABC):
     NO_NEW_PAGES_TO_STOP: int = 3
     # Hard safety cap on pages per location, whatever STOP_WHEN_NO_NEW decides.
     MAX_PAGES: int | None = None
+    # Consecutive failed pages that end a sweep. Only used in sweep mode, where
+    # the crawl goes deep enough to hit a bot wall mid-run; the incremental finder
+    # never gets far enough for this to matter.
+    SWEEP_FAILURES_TO_ABORT: int = 10
     # Page 1 decides the fate of the whole category — it is the only page that
     # yields the page count, so losing it discards every page behind it. One
     # blocked fetch must not cost a category, so it gets its own retries.
@@ -35,6 +40,12 @@ class BaseFinder(ABC):
     def __init__(self, method: str, proxy_url: str | None):
         self.config = get_config()
         self.logger = get_logger(self.__class__.__name__)
+        # Set by run_finder from the command line. `only_categories` restricts the
+        # run to one category (the sweep rotation crawls one per day); `sweep`
+        # turns off both depth limits so the run reaches the last page, which is
+        # what refreshes `last_seen_at` for listings too old to sit on page 1.
+        self.only_categories: set[str] | None = None
+        self.sweep: bool = False
         self.db = Database()
         self.fetcher = Fetcher(method=method, proxy_url=proxy_url)
         # get worker based on method and config 
@@ -44,6 +55,39 @@ class BaseFinder(ABC):
         
     def fetch_html(self, url: str) -> str:
         return self.fetcher.fetch(url, ready_marker=self.READY_MARKER)
+
+    def select_categories(self) -> list[tuple]:
+        """The categories this run should crawl.
+
+        Without --category that is all of them, exactly as before. With it, the
+        run is restricted to the named ones — that is how the weekly sweep spreads
+        the deep crawl over several days without a tracking table: each day takes
+        one category, and after a full rotation every live listing has been seen
+        again.
+
+        An unknown name is fatal rather than empty. A typo in the cron line would
+        otherwise crawl nothing, exit green, and let the age-based expiry mark a
+        whole category offline.
+        """
+        categories = list(self.get_categories())
+        if not self.only_categories:
+            return categories
+
+        available = {name.value: name for name, _ in categories}
+        unknown = self.only_categories - available.keys()
+        if unknown:
+            raise ValueError(
+                f"Unknown categor{'y' if len(unknown) == 1 else 'ies'} "
+                f"{', '.join(sorted(unknown))} for {self.__class__.__name__}. "
+                f"Available: {', '.join(sorted(available))}"
+            )
+
+        selected = [(name, category) for name, category in categories if name.value in self.only_categories]
+        self.logger.info(
+            f"Restricted to {len(selected)} of {len(categories)} categories: "
+            f"{', '.join(sorted(self.only_categories))}"
+        )
+        return selected
 
     def run(self):
         """
@@ -60,7 +104,7 @@ class BaseFinder(ABC):
         lost: list[str] = []
         total_new = 0
 
-        for category_name, category in self.get_categories():
+        for category_name, category in self.select_categories():
             locations = self.get_locations()
 
             self.logger.info(
@@ -125,7 +169,35 @@ class BaseFinder(ABC):
         if last_page <= 1:
             return True, location_new
 
-        # 2a. Early-stop mode: walk pages in order, stop once NO_NEW_PAGES_TO_STOP
+        # 2a. Sweep mode: every page, in order, no early stop. Sequential on
+        # purpose — CONCURRENT_PAGES is what the default branch below uses, and
+        # firing max_workers deep pages at immowelt or immoscout is the fastest
+        # way to get the run blocked. Depth is already the risk here; concurrency
+        # on top of it is not a trade worth making for a weekly job.
+        if self.sweep:
+            consecutive_failures = 0
+            for page in range(2, last_page + 1):
+                _, new_count = self.process_page_strategy(category, location, page)
+                if new_count is None:
+                    # Deep pages are where the bot walls live: DataDome starts
+                    # blocking immowelt around page 45. A run streak of failures
+                    # means we are blocked, not that those pages are empty —
+                    # grinding through the remaining hundred proves nothing and
+                    # just burns runner minutes against a wall.
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.SWEEP_FAILURES_TO_ABORT:
+                        self.logger.error(
+                            f"Sweep aborted at page {page} of {last_page} for {location}: "
+                            f"{consecutive_failures} consecutive failed pages — treating this "
+                            f"as blocked. Listings past here kept their old last_seen_at."
+                        )
+                        break
+                    continue
+                consecutive_failures = 0
+                location_new += new_count
+            return True, location_new
+
+        # 2b. Early-stop mode: walk pages in order, stop once NO_NEW_PAGES_TO_STOP
         # consecutive pages have no new listings (deeper pages are older, so all
         # already known). A single new listing resets the streak. A failed page
         # (new_count is None) is neutral — it neither confirms nor breaks the
@@ -148,7 +220,7 @@ class BaseFinder(ABC):
                     break
             return True, location_new
 
-        # 2b. Default: process the remaining pages concurrently
+        # 2c. Default: process the remaining pages concurrently
         if self.CONCURRENT_PAGES:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = [
@@ -219,17 +291,54 @@ class BaseFinder(ABC):
         pass
 
 
-def run_finder(finder_cls: type[BaseFinder]) -> None:
+def run_finder(finder_cls: type[BaseFinder], argv: list[str] | None = None) -> None:
     """Entry point for every `python -m find.<platform>` module.
 
     Exists so a crawl that collected nothing turns the workflow run RED. The
     finders used to swallow every per-page error and return normally, so a
     totally blocked run exited 0 and looked identical to a quiet day — the
     immoscout blackout of August 2026 ran green for two days.
+
+    Two modes:
+
+      incremental (default)  what the frequent cron runs. Newest-first, stops
+                             after NO_NEW_PAGES_TO_STOP empty pages, never goes
+                             past MAX_PAGES. Finds new listings.
+      --sweep                the weekly rotation. Crawls every page of the
+                             selected categories, which refreshes `last_seen_at`
+                             for the whole live inventory — the signal the
+                             age-based expiry needs. Slow and far more likely to
+                             be blocked, so it is a separate run and must never
+                             replace the incremental one.
     """
+    parser = argparse.ArgumentParser(description=finder_cls.__doc__ or finder_cls.__name__)
+    parser.add_argument(
+        "--category",
+        action="append",
+        metavar="NAME",
+        help="Crawl only this category (repeatable). Default: all of them.",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Crawl to the last page: no early stop, no MAX_PAGES cap.",
+    )
+    args = parser.parse_args(argv)
+
     finder = finder_cls()
+    if args.category:
+        finder.only_categories = {c.strip().upper() for c in args.category}
+    if args.sweep:
+        # Instance attributes shadow the class defaults for this run only.
+        finder.sweep = True
+        finder.MAX_PAGES = None
+        finder.logger.info("Sweep mode: crawling every page (no early stop, no page cap).")
+
     try:
         finder.run()
+    except ValueError as exc:
+        finder.logger.error(str(exc))
+        sys.exit(2)
     except FinderFailedError as exc:
         finder.logger.error(str(exc))
         sys.exit(1)
