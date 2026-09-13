@@ -51,14 +51,17 @@ class BaseFinder(ABC):
         # what refreshes `last_seen_at` for listings too old to sit on page 1.
         self.only_categories: set[str] | None = None
         self.sweep: bool = False
-        # Sweep completeness, tallied across the whole run. `_sweep_complete`
-        # starts True and only ever goes False: one failed page, one aborted
-        # pagination or one lost page 1 anywhere in the run disqualifies the
-        # entire sweep. It has to be that strict, because reconcile.py reads it
-        # as permission to deactivate everything the run did not see.
+        # Sweep completeness, tallied across the whole run. The bar is zero
+        # failed pages, because reconcile.py reads `complete` as permission to
+        # deactivate everything the run did not see.
+        #
+        # `_hard_incomplete` is what a retry cannot rescue: a lost page 1, or a
+        # pagination we abandoned mid-way. `_failed_pages` is what it can --
+        # individual pages that errored, retried once before the run is scored.
         self._pages_ok: int = 0
         self._pages_failed: int = 0
-        self._sweep_complete: bool = True
+        self._hard_incomplete: bool = False
+        self._failed_pages: list[tuple] = []
         self._sweep_detail: list[str] = []
         # Kleinanzeigen crawls locations and pages concurrently, so the tallies
         # are touched from several threads. `complete` is a plain assignment and
@@ -146,15 +149,54 @@ class BaseFinder(ABC):
         finally:
             if run_id is not None:
                 if lost:
-                    self._sweep_complete = False
+                    self._hard_incomplete = True
                     self._sweep_detail.append(f"lost page 1: {', '.join(lost)}")
+                self._retry_failed_pages()
+                complete = not self._hard_incomplete and not self._failed_pages
+                if self._failed_pages:
+                    self._sweep_detail.append(
+                        f"{len(self._failed_pages)} pages still failing after retry")
                 self.db.finish_sweep_run(
-                    run_id, self._sweep_complete, self._pages_ok, self._pages_failed,
+                    run_id, complete, self._pages_ok, self._pages_failed,
                     "; ".join(self._sweep_detail) or None)
 
         self.logger.info(f"Crawl finished: {total_new} new listings, {len(lost)} lost page 1.")
         if lost:
             raise FinderFailedError(lost, total_new)
+
+    def _retry_failed_pages(self) -> None:
+        """One more attempt at the pages that errored, before writing the run off.
+
+        Zero failed pages is the right bar — a page we could not read is a page
+        whose listings we cannot claim to have seen — but on a big crawl it is a
+        bar nothing clears by luck. Kleinanzeigen's find walks ~2 730 pages and
+        lost 10 of them to transient errors on 2026-09-13; under a strict rule
+        with no retry that would have blocked reconciliation for the source
+        forever while the crawl was in fact 99.6 % fine.
+
+        Retrying is what makes the strict bar affordable: a transient failure
+        costs one more fetch, and only a page that fails twice blocks the source.
+
+        Sequential whatever CONCURRENT_PAGES says. This is a short tail, and if
+        the failures were rate-limiting then going again in parallel is the one
+        thing guaranteed not to help.
+        """
+        pending, self._failed_pages = self._failed_pages, []
+        if not pending:
+            return
+
+        self.logger.info(f"Retrying {len(pending)} failed page(s) before scoring the run.")
+        recovered = 0
+        for category, location, page in pending:
+            _, new_count = self.process_page_strategy(category, location, page)
+            if new_count is not None:
+                recovered += 1
+                with self._tally_lock:
+                    self._pages_failed -= 1
+        self.logger.info(
+            f"Retry recovered {recovered} of {len(pending)} pages; "
+            f"{len(self._failed_pages)} still failing."
+        )
 
     def _crawl(self, categories) -> tuple[int, list[str]]:
         """The crawl itself. Split out of run() so the sweep record is written
@@ -247,6 +289,7 @@ class BaseFinder(ABC):
                             f"{consecutive_failures} consecutive failed pages — treating this "
                             f"as blocked. Listings past here kept their old last_seen_at."
                         )
+                        self._hard_incomplete = True
                         self._sweep_detail.append(
                             f"aborted at page {page}/{last_page} for {location}")
                         break
@@ -331,7 +374,7 @@ class BaseFinder(ABC):
             # reconcile.py would otherwise deactivate every one of them.
             with self._tally_lock:
                 self._pages_failed += 1
-            self._sweep_complete = False
+                self._failed_pages.append((category, location, page))
             return 0, None
 
     # --- Abstract Methods ---
