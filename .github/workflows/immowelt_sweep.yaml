@@ -3,7 +3,10 @@ name: Run Immowelt Sweep
 # The weekly last_seen_at sweep, NOT the finder that hunts for new listings.
 # See immoscout_sweep.yaml for why this exists; ../expire.py is what consumes it.
 #
-# One category per day, rotated by the VPS crontab — four categories, four days.
+# Two groups, each swept twice a week by the VPS crontab (Mon+Thu, Tue+Fri). The
+# balanced split here falls on a different axis than immoscout's: houses against
+# flats, 178 vs 200 pages, because HAUS_KAUFEN alone is 172 of the 378.
+#
 # Depth is the whole point here and also the whole risk: DataDome starts blocking
 # immowelt around page 45, which is exactly why the incremental finder caps at
 # MAX_PAGES=20. A sweep that gets blocked deep is acceptable (the pages it did
@@ -14,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       category:
-        description: 'Category to sweep (WOHNUNG_KAUFEN, WOHNUNG_MIETEN, HAUS_KAUFEN, HAUS_MIETEN)'
+        description: 'Categories to sweep, comma-separated (WOHNUNG_KAUFEN, WOHNUNG_MIETEN, HAUS_KAUFEN, HAUS_MIETEN)'
         required: true
         type: string
       retry_count:

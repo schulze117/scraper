@@ -315,8 +315,9 @@ def run_finder(finder_cls: type[BaseFinder], argv: list[str] | None = None) -> N
     parser.add_argument(
         "--category",
         action="append",
-        metavar="NAME",
-        help="Crawl only this category (repeatable). Default: all of them.",
+        metavar="NAME[,NAME...]",
+        help="Crawl only these categories (repeatable, or comma-separated). "
+             "Default: all of them.",
     )
     parser.add_argument(
         "--sweep",
@@ -327,7 +328,10 @@ def run_finder(finder_cls: type[BaseFinder], argv: list[str] | None = None) -> N
 
     finder = finder_cls()
     if args.category:
-        finder.only_categories = {c.strip().upper() for c in args.category}
+        # Comma-separated as well as repeatable: a workflow_dispatch input is a
+        # single string, and the sweep rotation runs two categories per slot.
+        finder.only_categories = {
+            c.strip().upper() for arg in args.category for c in arg.split(",") if c.strip()}
     if args.sweep:
         # Instance attributes shadow the class defaults for this run only.
         finder.sweep = True
