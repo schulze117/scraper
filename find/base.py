@@ -1,16 +1,21 @@
 import argparse
 import concurrent.futures
 import sys
+import threading
 from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup
 from lib.logger import get_logger
 from lib.fetch.fetcher import Fetcher
 from lib.database import Database
 from lib.config import get_config
+from lib.models import ListingSource
 from lib.exceptions import FinderFailedError
 
 
 class BaseFinder(ABC):
+    # Which portal this finder speaks for. Only the sweep record needs it -- the
+    # listings themselves carry their own source from get_listings.
+    SOURCE: ListingSource
     # Default behavior: Process locations sequentially (safer for tough sites like Immoscout)
     CONCURRENT_LOCATIONS = False
     CONCURRENT_PAGES = True
@@ -46,6 +51,19 @@ class BaseFinder(ABC):
         # what refreshes `last_seen_at` for listings too old to sit on page 1.
         self.only_categories: set[str] | None = None
         self.sweep: bool = False
+        # Sweep completeness, tallied across the whole run. `_sweep_complete`
+        # starts True and only ever goes False: one failed page, one aborted
+        # pagination or one lost page 1 anywhere in the run disqualifies the
+        # entire sweep. It has to be that strict, because reconcile.py reads it
+        # as permission to deactivate everything the run did not see.
+        self._pages_ok: int = 0
+        self._pages_failed: int = 0
+        self._sweep_complete: bool = True
+        self._sweep_detail: list[str] = []
+        # Kleinanzeigen crawls locations and pages concurrently, so the tallies
+        # are touched from several threads. `complete` is a plain assignment and
+        # safe either way; the counts are not, and they end up in the record.
+        self._tally_lock = threading.Lock()
         self.db = Database()
         self.fetcher = Fetcher(method=method, proxy_url=proxy_url)
         # get worker based on method and config 
@@ -55,6 +73,19 @@ class BaseFinder(ABC):
         
     def fetch_html(self, url: str) -> str:
         return self.fetcher.fetch(url, ready_marker=self.READY_MARKER)
+
+    @property
+    def is_exhaustive(self) -> bool:
+        """Does this run walk every page, so its absences mean something?
+
+        True in sweep mode, and also for a finder that has no early stop at all —
+        kleinanzeigen crawls to the last page on every ordinary run, so every one
+        of its runs is a sweep and gets recorded as one. Without this it would
+        never produce a complete sweep record and reconcile.py would block on it
+        forever, which is the correct default for a source nothing sweeps and the
+        wrong answer for this one.
+        """
+        return self.sweep or not self.STOP_WHEN_NO_NEW
 
     def select_categories(self) -> list[tuple]:
         """The categories this run should crawl.
@@ -104,7 +135,34 @@ class BaseFinder(ABC):
         lost: list[str] = []
         total_new = 0
 
-        for category_name, category in self.select_categories():
+        categories = self.select_categories()
+        run_id = None
+        if self.is_exhaustive:
+            run_id = self.db.start_sweep_run(
+                self.SOURCE, sorted(name.value for name, _ in categories))
+
+        try:
+            total_new, lost = self._crawl(categories)
+        finally:
+            if run_id is not None:
+                if lost:
+                    self._sweep_complete = False
+                    self._sweep_detail.append(f"lost page 1: {', '.join(lost)}")
+                self.db.finish_sweep_run(
+                    run_id, self._sweep_complete, self._pages_ok, self._pages_failed,
+                    "; ".join(self._sweep_detail) or None)
+
+        self.logger.info(f"Crawl finished: {total_new} new listings, {len(lost)} lost page 1.")
+        if lost:
+            raise FinderFailedError(lost, total_new)
+
+    def _crawl(self, categories) -> tuple[int, list[str]]:
+        """The crawl itself. Split out of run() so the sweep record is written
+        even when this raises."""
+        lost: list[str] = []
+        total_new = 0
+
+        for category_name, category in categories:
             locations = self.get_locations()
 
             self.logger.info(
@@ -133,9 +191,7 @@ class BaseFinder(ABC):
                     if not page_one_ok:
                         lost.append(f"{category_name}/{location}")
 
-        self.logger.info(f"Crawl finished: {total_new} new listings, {len(lost)} lost page 1.")
-        if lost:
-            raise FinderFailedError(lost, total_new)
+        return total_new, lost
 
     def process_location(self, category, location) -> tuple[bool, int]:
         """Strategy for a single location.
@@ -191,6 +247,8 @@ class BaseFinder(ABC):
                             f"{consecutive_failures} consecutive failed pages — treating this "
                             f"as blocked. Listings past here kept their old last_seen_at."
                         )
+                        self._sweep_detail.append(
+                            f"aborted at page {page}/{last_page} for {location}")
                         break
                     continue
                 consecutive_failures = 0
@@ -262,10 +320,18 @@ class BaseFinder(ABC):
                 # f"\tCategory {category} \tLocation {location}"
                 f"\tURL {url}"
             )
+            with self._tally_lock:
+                self._pages_ok += 1
             return pages_count, new_count
 
         except Exception as e:
             self.logger.error(f"Failed page {page} for {location} (URL: {url}): {e}")
+            # One failed page disqualifies the whole sweep. A page we could not
+            # read is a page whose listings we cannot claim to have seen, and
+            # reconcile.py would otherwise deactivate every one of them.
+            with self._tally_lock:
+                self._pages_failed += 1
+            self._sweep_complete = False
             return 0, None
 
     # --- Abstract Methods ---

@@ -1,0 +1,75 @@
+name: Reconcile Active Listings
+
+# Deactivates every listing that a COMPLETE sweep cycle did not see — see
+# ../reconcile.py for what complete has to mean, and why an exit code is not
+# enough to establish it.
+#
+# Does nothing for a source whose categories are not all covered by clean sweeps.
+# That is the designed behaviour: absence only means offline if we actually
+# looked everywhere.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Write. Unset for a dry run that only reports.'
+        required: false
+        default: true
+        type: boolean
+      max_share:
+        description: 'Refuse above this share (default 0.25). Raise only to clear the initial backlog, once.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reconcile
+  cancel-in-progress: false
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Create config.json
+        env:
+          CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
+        run: echo "$CONFIG_JSON_CONTENT" > config.json
+
+      - name: Create .env file
+        run: |
+          touch .env
+          echo "DATABASE__USER=${{ secrets.DATABASE__USER }}" >> .env
+          echo "DATABASE__HOST=${{ secrets.DATABASE__HOST }}" >> .env
+          echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
+          echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
+          echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
+
+      # if/then, not `[ ... ] && ...`: GitHub runs this with `bash -e`, where a
+      # failing test at the end of an && list aborts the whole step.
+      - name: Reconcile
+        env:
+          APPLY: ${{ inputs.apply }}
+          MAX_SHARE: ${{ inputs.max_share }}
+        run: |
+          ARGS=""
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ -n "$MAX_SHARE" ]; then ARGS="$ARGS --max-share $MAX_SHARE"; fi
+          echo "python -m reconcile$ARGS"
+          python -m reconcile $ARGS

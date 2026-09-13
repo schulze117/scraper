@@ -51,6 +51,7 @@ def extract_listing_data(listing: dict[str, Any]) -> NewListing:
     )
 
 class ImmoscoutFinder(BaseFinder):
+    SOURCE = ListingSource.IMMOBILIENSCOUT24
     CONCURRENT_LOCATIONS = False
     BASE_URL = "https://www.immobilienscout24.de/Suche/shape"
     # After the WAF challenge clears, wait until the results JSON is actually in

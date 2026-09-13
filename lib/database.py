@@ -61,15 +61,29 @@ SELECT_PROPERTY_IDS_SQL = SQL(
     """
 ).format(schema=Identifier("fixnflip_v2"), table=Identifier("property"))
 
+# A sighting REACTIVATES. If the portal still serves the listing on its own search
+# results page, it is online — that outranks whatever made us mark it dead.
+#
+# This used to be DO NOTHING, with a comment saying the scraper owned the flag.
+# The scraper only ever owned one direction: it has `deactivate_listing` and no
+# counterpart, so `active = FALSE` was permanent. Every transient scrape failure
+# that tripped `is_deactivated_listing` killed a live listing for good — 6 183 of
+# them on 2026-09-13 were marked inactive while the finder was still seeing them
+# that same week, immowelt worst hit because its check is as loose as
+# `"Main section" in str(exception)`.
+#
+# Deactivation is now recoverable, which is also what makes the sweep's
+# reconciliation safe to be aggressive: a false positive costs one cycle, not the
+# listing.
 GENERAL_INSERT_SQL: Composed = SQL(
-    # Dont update active status to True on conflicts since this will be handled by scraper and not finder
-    "INSERT INTO {schema}.{table} ({fields}) VALUES ({values}) ON CONFLICT ({conflict}) DO NOTHING"
+    "INSERT INTO {schema}.{table} ({fields}) VALUES ({values}) ON CONFLICT ({conflict}) DO UPDATE SET {updates}"
 ).format(
     schema=Identifier("fixnflip_v2"),
     table=Identifier("general"),
     fields=SQL(", ").join([Identifier("property_id"), Identifier("active")]),
     values=SQL(", ").join([Placeholder("property_id"), Placeholder("active")]),
     conflict=Identifier("property_id"),
+    updates=SQL("{0} = TRUE").format(Identifier("active")),
 )
 
 SYSTEM_INSERT_SQL: Composed = SQL(
@@ -254,6 +268,77 @@ EXPIRE_STALE_LISTINGS_SQL: Composed = SQL(
         AND (g.active = TRUE OR g.active IS NULL)
         AND s.last_seen_at IS NOT NULL
         AND s.last_seen_at < now() - %(max_age)s::interval
+    """
+)
+
+
+START_SWEEP_RUN_SQL: Composed = SQL(
+    """
+    INSERT INTO fixnflip_v2.sweep_run (source, categories)
+    VALUES (%(source)s, %(categories)s)
+    RETURNING id
+    """
+)
+
+FINISH_SWEEP_RUN_SQL: Composed = SQL(
+    """
+    UPDATE fixnflip_v2.sweep_run
+    SET finished_at = now(), complete = %(complete)s,
+        pages_ok = %(pages_ok)s, pages_failed = %(pages_failed)s, detail = %(detail)s
+    WHERE id = %(id)s
+    """
+)
+
+# When was every category of this source last covered by a COMPLETE sweep, and
+# how many categories is that? The oldest of those timestamps is the cycle start:
+# before it, the whole inventory had been walked at least once. A listing not
+# seen since then was seen by nobody in a full cycle, which is the definition of
+# offline we can actually defend.
+#
+# Deliberately keyed on categories rather than on sweep groups. The reconciler
+# then has no opinion about how the crontab groups them, and adding a category
+# blocks reconciliation until that category has had a clean sweep of its own --
+# which is the right failure, because a category nobody sweeps produces no
+# absence and would otherwise stay active forever.
+SWEEP_COVERAGE_SQL: Composed = SQL(
+    """
+    WITH latest AS (
+        SELECT unnest(categories) AS category, max(started_at) AS started_at
+        FROM fixnflip_v2.sweep_run
+        WHERE source = %(source)s AND complete
+        GROUP BY 1
+    )
+    SELECT min(started_at) AS cycle_start,
+           count(*)        AS categories_covered,
+           array_agg(category ORDER BY category) AS categories
+    FROM latest
+    """
+)
+
+COUNT_UNSEEN_SINCE_SQL: Composed = SQL(
+    """
+    SELECT count(*) FILTER (WHERE s.last_seen_at < %(cycle_start)s) AS unseen,
+           count(*) AS active
+    FROM fixnflip_v2.property p
+    JOIN fixnflip_v2.system s ON s.property_id = p.id
+    LEFT JOIN fixnflip_v2.general g ON g.property_id = p.id
+    WHERE p.source = %(source)s
+        AND (g.active = TRUE OR g.active IS NULL)
+        AND s.last_seen_at IS NOT NULL
+    """
+)
+
+DEACTIVATE_UNSEEN_SINCE_SQL: Composed = SQL(
+    """
+    UPDATE fixnflip_v2.general g
+    SET active = FALSE
+    FROM fixnflip_v2.property p
+    JOIN fixnflip_v2.system s ON s.property_id = p.id
+    WHERE g.property_id = p.id
+        AND p.source = %(source)s
+        AND (g.active = TRUE OR g.active IS NULL)
+        AND s.last_seen_at IS NOT NULL
+        AND s.last_seen_at < %(cycle_start)s
     """
 )
 
@@ -460,6 +545,58 @@ class Database:
             cursor.execute(DELETE_LISTING_SQL, {"property_id": uuid})
             connection.commit()
             self.logger.debug(f"Listing {uuid} deleted")
+
+    @db_operation_with_retry
+    def start_sweep_run(self, source: ListingSource, categories: list[str]) -> UUID:
+        with self._db() as (connection, cursor):
+            cursor.execute(START_SWEEP_RUN_SQL,
+                           {"source": source.value, "categories": categories})
+            row = cursor.fetchone()
+            connection.commit()
+            run_id = row["id"]  # type: ignore[index]
+            self.logger.info(f"Sweep run {run_id} started for {source.value}: {', '.join(categories)}")
+            return run_id
+
+    @db_operation_with_retry
+    def finish_sweep_run(self, run_id: UUID, complete: bool,
+                         pages_ok: int, pages_failed: int, detail: str | None = None) -> None:
+        with self._db() as (connection, cursor):
+            cursor.execute(FINISH_SWEEP_RUN_SQL, {
+                "id": run_id, "complete": complete,
+                "pages_ok": pages_ok, "pages_failed": pages_failed, "detail": detail})
+            connection.commit()
+        self.logger.info(
+            f"Sweep run {run_id} finished: complete={complete}, "
+            f"{pages_ok} pages ok, {pages_failed} failed"
+            + (f" — {detail}" if detail else ""))
+
+    @db_operation_with_retry
+    def sweep_coverage(self, source: ListingSource) -> tuple[Any, int, list[str]]:
+        """(cycle_start, categories covered, their names) from complete sweeps."""
+        with self._db() as (_, cursor):
+            cursor.execute(SWEEP_COVERAGE_SQL, {"source": source.value})
+            row = cursor.fetchone()
+            if not row or row["categories_covered"] == 0:
+                return None, 0, []
+            return row["cycle_start"], row["categories_covered"], list(row["categories"] or [])
+
+    @db_operation_with_retry
+    def count_unseen_since(self, source: ListingSource, cycle_start) -> tuple[int, int]:
+        with self._db() as (_, cursor):
+            cursor.execute(COUNT_UNSEEN_SINCE_SQL,
+                           {"source": source.value, "cycle_start": cycle_start})
+            row = cursor.fetchone()
+            return (row["unseen"], row["active"]) if row else (0, 0)
+
+    @db_operation_with_retry
+    def deactivate_unseen_since(self, source: ListingSource, cycle_start) -> int:
+        with self._db() as (connection, cursor):
+            cursor.execute(DEACTIVATE_UNSEEN_SINCE_SQL,
+                           {"source": source.value, "cycle_start": cycle_start})
+            n = cursor.rowcount
+            connection.commit()
+            self.logger.info(f"Deactivated {n} {source.value} listings unseen since {cycle_start}")
+            return n
 
     @db_operation_with_retry
     def count_stale_listings(self, source: ListingSource, max_age_days: int) -> tuple[int, int]:

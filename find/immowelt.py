@@ -18,6 +18,7 @@ lz = LZString()
 
 
 class ImmoweltFinder(BaseFinder):
+    SOURCE = ListingSource.IMMOWELT
     CONCURRENT_LOCATIONS = False
     BASE_URL = "https://www.immowelt.de/classified-search"
     # build_url pins order=DateDesc, so results are newest-first: >95% of new

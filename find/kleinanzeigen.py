@@ -8,6 +8,7 @@ from .base import BaseFinder, run_finder
 config = get_config()
 
 class KleinanzeigenFinder(BaseFinder):
+    SOURCE = ListingSource.KLEINANZEIGEN
     LISTINGS_PER_PAGE = 25
     CONCURRENT_LOCATIONS = True
     BASE_URL = "https://www.kleinanzeigen.de/"
