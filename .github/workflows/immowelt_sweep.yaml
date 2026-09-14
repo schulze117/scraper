@@ -22,6 +22,11 @@ on:
         description: 'Categories to sweep, comma-separated (WOHNUNG_KAUFEN, WOHNUNG_MIETEN, HAUS_KAUFEN, HAUS_MIETEN)'
         required: true
         type: string
+      use_proxy:
+        description: 'Route through the AI-server residential proxy over Tailscale'
+        required: false
+        default: false
+        type: boolean
       retry_count:
         description: 'Bot detection retry attempt'
         required: false
@@ -41,6 +46,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
+    # Off by default, unlike immoscout. immowelt has always run direct from the
+    # GitHub runner and DataDome tolerates that far better than immoscout's WAF
+    # tolerates a datacenter IP -- but it still walls the sweep at page 49 of
+    # 172, which is the one thing that keeps immowelt out of reconcile.py. This
+    # switch exists to test whether the residential exit clears that wall.
+    #
+    # It is a shared resource: the same AI server carries immoscout find and
+    # scrape, and the crontab keeps those two apart on purpose. A proxied
+    # immowelt sweep is a third user of it, so check what else holds it before
+    # dispatching one -- ../ecosystem.md#schedules.
+    env:
+      USE_PROXY: ${{ inputs.use_proxy }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -55,6 +73,13 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      - name: Connect to Tailscale
+        if: ${{ inputs.use_proxy }}
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: gha-immowelt-sweep
+
       - name: Create config.json
         env:
           CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
@@ -68,7 +93,11 @@ jobs:
           echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
-          echo "PROXY_URL__IMMOWELT=${{ secrets.PROXY_URL__IMMOWELT }}" >> .env
+          # PROXY_URL only. `resolve_proxy` prefers PROXY_URL__IMMOWELT, and
+          # that secret still holds the metered DataImpulse endpoint -- writing
+          # it here would silently send this run somewhere other than the AI
+          # server, which is the whole thing being tested.
+          echo "PROXY_URL=${{ secrets.PROXY_URL }}" >> .env
 
       - name: Create Service Account JSON
         run: echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > immofinder-438008-411bf1440a6c.json
@@ -102,7 +131,7 @@ jobs:
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/repos/${{ github.repository }}/actions/workflows/immowelt_sweep.yaml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"retry_count\":\"$((RETRY+1))\",\"category\":\"${{ inputs.category }}\"}}")
+              -d "{\"ref\":\"main\",\"inputs\":{\"retry_count\":\"$((RETRY+1))\",\"category\":\"${{ inputs.category }}\",\"use_proxy\":${{ inputs.use_proxy }}}}")
             echo "API response: $STATUS"
             [ "$STATUS" = "204" ] || exit 1
           else
