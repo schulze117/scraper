@@ -22,7 +22,9 @@ absence is real rather than a crawl that fell over, so a run counts only when:
 What makes this safe to run often is that it is reversible: since 2026-09-13 a
 sighting reactivates (`GENERAL_INSERT_SQL`), so a listing wrongly deactivated
 here comes back by itself on the next sweep that sees it. That is why this
-replaced the 21-day age rule in `expire.py`, which is kept only as a backstop.
+replaced the 21-day age rule in `expire.py`, which was deleted rather than kept
+as a backstop — see CLAUDE.md for why a clock and a set difference must not both
+be allowed to write this flag.
 """
 
 import argparse

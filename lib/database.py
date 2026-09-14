@@ -244,34 +244,6 @@ DELETE_LISTING_SQL = SQL(
 )
 
 
-COUNT_STALE_LISTINGS_SQL: Composed = SQL(
-    """
-    SELECT count(*) FILTER (WHERE s.last_seen_at < now() - %(max_age)s::interval) AS stale,
-           count(*) AS active
-    FROM fixnflip_v2.property p
-    JOIN fixnflip_v2.system s ON s.property_id = p.id
-    LEFT JOIN fixnflip_v2.general g ON g.property_id = p.id
-    WHERE p.source = %(source)s
-        AND (g.active = TRUE OR g.active IS NULL)
-        AND s.last_seen_at IS NOT NULL
-    """
-)
-
-EXPIRE_STALE_LISTINGS_SQL: Composed = SQL(
-    """
-    UPDATE fixnflip_v2.general g
-    SET active = FALSE
-    FROM fixnflip_v2.property p
-    JOIN fixnflip_v2.system s ON s.property_id = p.id
-    WHERE g.property_id = p.id
-        AND p.source = %(source)s
-        AND (g.active = TRUE OR g.active IS NULL)
-        AND s.last_seen_at IS NOT NULL
-        AND s.last_seen_at < now() - %(max_age)s::interval
-    """
-)
-
-
 START_SWEEP_RUN_SQL: Composed = SQL(
     """
     INSERT INTO fixnflip_v2.sweep_run (source, categories)
@@ -597,37 +569,6 @@ class Database:
             connection.commit()
             self.logger.info(f"Deactivated {n} {source.value} listings unseen since {cycle_start}")
             return n
-
-    @db_operation_with_retry
-    def count_stale_listings(self, source: ListingSource, max_age_days: int) -> tuple[int, int]:
-        """(stale, active) for one source. Stale = active but not seen by the
-        finder in max_age_days."""
-        with self._db() as (_, cursor):
-            cursor.execute(
-                COUNT_STALE_LISTINGS_SQL,
-                {"source": source.value, "max_age": f"{max_age_days} days"},
-            )
-            row = cursor.fetchone()
-            return (row["stale"], row["active"]) if row else (0, 0)
-
-    @db_operation_with_retry
-    def expire_stale_listings(self, source: ListingSource, max_age_days: int) -> int:
-        """Mark listings inactive that the finder has not seen in max_age_days.
-
-        `last_seen_at` is only meaningful once the weekly sweep runs, because the
-        incremental finder stops after a few pages and never reaches the older
-        listings. Callers must therefore check the sweep actually completed before
-        calling this — see expire.py, which refuses on an implausible share.
-        """
-        with self._db() as (connection, cursor):
-            cursor.execute(
-                EXPIRE_STALE_LISTINGS_SQL,
-                {"source": source.value, "max_age": f"{max_age_days} days"},
-            )
-            expired = cursor.rowcount
-            connection.commit()
-            self.logger.info(f"Expired {expired} {source.value} listings not seen in {max_age_days} days")
-            return expired
 
     @db_operation_with_retry
     def update_extra_data(self, uuid: UUID, extra_data: dict[str, dict[str, Any]]) -> None:

@@ -5,14 +5,14 @@ name: Run Immoscout Sweep
 # The incremental finder (immoscout_find.yaml) stops after three pages with
 # nothing new, so it never reaches the older listings and never refreshes their
 # `system.last_seen_at`. This run crawls one category to its last page, which
-# refreshes the whole live inventory of that category. `expire.py` turns that
-# into `general.active`.
+# refreshes the whole live inventory of that category. `reconcile.py` turns that
+# into `general.active`, by deactivating whatever a complete cycle did not see.
 #
-# Two groups, each swept twice a week by the VPS crontab (Mon+Thu, Tue+Fri), so
-# every category is checked twice and no listing's last_seen_at is ever more than
-# four days stale. The groups are sized to be about equal rather than to be tidy:
-# WOHNUNG_MIETEN alone is 515 of the 1114 pages, so it is the rent categories
-# against the buy ones — 535 vs 579 pages, measured 2026-09-13.
+# Two groups, each swept three times a week by the VPS crontab (Mon/Wed/Fri,
+# Tue/Thu/Sat), so no listing's last_seen_at is ever more than two days stale.
+# The groups are sized to be about equal rather than to be tidy: WOHNUNG_MIETEN
+# alone is 524 of the 1123 pages, so it is the rent categories against the buy
+# ones — 544 vs 579 pages, measured 2026-09-14.
 #
 # Split at all because a full crawl of all five in one run is hours on the one
 # residential IP that clears the WAF, and because a blocked run then only costs
