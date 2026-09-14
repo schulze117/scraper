@@ -100,8 +100,8 @@ class BaseFinder(ABC):
         again.
 
         An unknown name is fatal rather than empty. A typo in the cron line would
-        otherwise crawl nothing, exit green, and let the age-based expiry mark a
-        whole category offline.
+        otherwise crawl nothing and exit green, which reconcile.py would read as a
+        category nobody sweeps — blocking deactivation for the whole source.
         """
         categories = list(self.get_categories())
         if not self.only_categories:
@@ -185,14 +185,19 @@ class BaseFinder(ABC):
         if not pending:
             return
 
+        # Take the first attempt's failures back off the tally and let the retry
+        # score these pages from scratch: process_page_strategy counts every
+        # failure it sees, so leaving them on would count a page that fails twice
+        # as two failed pages. That is how a 10-page abort was recorded as 20.
+        with self._tally_lock:
+            self._pages_failed -= len(pending)
+
         self.logger.info(f"Retrying {len(pending)} failed page(s) before scoring the run.")
         recovered = 0
         for category, location, page in pending:
             _, new_count = self.process_page_strategy(category, location, page)
             if new_count is not None:
                 recovered += 1
-                with self._tally_lock:
-                    self._pages_failed -= 1
         self.logger.info(
             f"Retry recovered {recovered} of {len(pending)} pages; "
             f"{len(self._failed_pages)} still failing."

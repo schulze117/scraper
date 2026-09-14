@@ -12,7 +12,7 @@ on:
       time_budget_min:
         description: 'Minutes of scraping before the run stops itself (0 = unlimited)'
         required: false
-        default: '100'
+        default: '170'
       use_proxy:
         description: 'Route through the AI-server proxy over Tailscale (set false to force a direct, unproxied run)'
         required: false
@@ -35,9 +35,16 @@ jobs:
 
     # Backstop only. GitHub kills a hosted job at 6 h and reports that as
     # `cancelled` — no exit code, no summary, looks exactly like a crash. The
-    # scraper stops itself at `time_budget_min` well before this, so hitting 120
+    # scraper stops itself at `time_budget_min` well before this, so hitting 195
     # means the budget failed to apply, and a red run says so.
-    timeout-minutes: 120
+    #
+    # **It must stay above the budget the crontab passes in, or it becomes the
+    # mechanism instead of the backstop — silently.** It was 120 against a
+    # crontab budget of 170 from the move to 6-hourly slots until 2026-09-14, so
+    # every single run was killed at 2 h and reported `cancelled`: no exit code,
+    # no log line, ~50 min of scraping lost per cycle. Raising the crontab budget
+    # means raising this in the same change.
+    timeout-minutes: 195
 
     # Empty on a hand-run dispatch -> resolve_proxy() falls back to
     # config.scrape.immoscout.use_proxy (true) -> proxy on, and the scraper falls

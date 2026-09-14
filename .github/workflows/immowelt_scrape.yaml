@@ -8,7 +8,7 @@ on:
       time_budget_min:
         description: 'Minutes of scraping before the run stops itself (0 = unlimited)'
         required: false
-        default: '220'
+        default: '300'
       retry_count:
         description: 'Bot detection retry attempt'
         required: false
@@ -31,9 +31,10 @@ jobs:
   run-script:
     runs-on: ubuntu-latest
 
-    # Backstop only — see immoscout_scrape.yaml. The scraper stops itself at
-    # `time_budget_min` long before this.
-    timeout-minutes: 240
+    # Backstop only — see immoscout_scrape.yaml, including why this has to stay
+    # above the budget the crontab passes in. It was 240 against a budget of 300
+    # until 2026-09-14, so every run died at 4 h as `cancelled`.
+    timeout-minutes: 325
 
     env:
       SCRAPE_TIME_BUDGET_MIN: ${{ inputs.time_budget_min }}
