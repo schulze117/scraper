@@ -9,7 +9,7 @@ from lib.fetch.fetcher import Fetcher
 from lib.database import Database
 from lib.config import get_config
 from lib.models import ListingSource
-from lib.exceptions import FinderFailedError
+from lib.exceptions import FinderFailedError, ResultTailReachedError
 
 
 class BaseFinder(ABC):
@@ -37,6 +37,21 @@ class BaseFinder(ABC):
     # the crawl goes deep enough to hit a bot wall mid-run; the incremental finder
     # never gets far enough for this to matter.
     SWEEP_FAILURES_TO_ABORT: int = 10
+    # Consecutive all-undated pages that mean the result set has ended, and the
+    # earliest point in a category at which that may be believed, as a share of
+    # the advertised page count.
+    #
+    # Both halves guard the same mistake. A parser signals the tail by raising
+    # ResultTailReachedError (immoscout: every entry intact but carrying no
+    # `@creation`), and the honest reading of that is "the dated listings ran
+    # out". The dishonest one is "`@creation` was renamed and every page now
+    # looks like this" — which would end each category on page 1 and record the
+    # sweep as COMPLETE, handing reconcile.py permission to deactivate an entire
+    # portal. So the run wants to see it three pages running, and not before it
+    # is a tenth of the way in. A rename fails both tests on page 1; a real tail
+    # sits at 40-95 % of the advertised count and passes them easily.
+    RESULT_TAIL_PAGES_TO_STOP: int = 3
+    RESULT_TAIL_MIN_DEPTH_SHARE: float = 0.10
     # Page 1 decides the fate of the whole category — it is the only page that
     # yields the page count, so losing it discards every page behind it. One
     # blocked fetch must not cost a category, so it gets its own retries.
@@ -63,6 +78,9 @@ class BaseFinder(ABC):
         self._hard_incomplete: bool = False
         self._failed_pages: list[tuple] = []
         self._sweep_detail: list[str] = []
+        # Pages that were the undated tail rather than listings. Recorded so the
+        # sweep row shows how much of the advertised depth was real.
+        self._pages_tail: int = 0
         # Kleinanzeigen crawls locations and pages concurrently, so the tallies
         # are touched from several threads. `complete` is a plain assignment and
         # safe either way; the counts are not, and they end up in the record.
@@ -156,6 +174,8 @@ class BaseFinder(ABC):
                 if self._failed_pages:
                     self._sweep_detail.append(
                         f"{len(self._failed_pages)} pages still failing after retry")
+                if self._pages_tail:
+                    self._sweep_detail.append(f"{self._pages_tail} undated tail pages")
                 self.db.finish_sweep_run(
                     run_id, complete, self._pages_ok, self._pages_failed,
                     "; ".join(self._sweep_detail) or None)
@@ -195,7 +215,7 @@ class BaseFinder(ABC):
         self.logger.info(f"Retrying {len(pending)} failed page(s) before scoring the run.")
         recovered = 0
         for category, location, page in pending:
-            _, new_count = self.process_page_strategy(category, location, page)
+            _, new_count, _ = self.process_page_strategy(category, location, page)
             if new_count is not None:
                 recovered += 1
         self.logger.info(
@@ -249,7 +269,7 @@ class BaseFinder(ABC):
         # is retried on its own: it carries the page count, so a single blocked
         # fetch would otherwise discard every page behind it.
         for attempt in range(1, self.PAGE_ONE_ATTEMPTS + 1):
-            pages_count, new_count = self.process_page_strategy(category, location, page=1)
+            pages_count, new_count, _ = self.process_page_strategy(category, location, page=1)
             if new_count is not None:
                 break
             if attempt < self.PAGE_ONE_ATTEMPTS:
@@ -279,8 +299,50 @@ class BaseFinder(ABC):
         # on top of it is not a trade worth making for a weekly job.
         if self.sweep:
             consecutive_failures = 0
+            tail_streak = 0
+            # The earliest page at which an all-undated run may be read as the end
+            # of the results. A real tail begins around 40-95 % of the advertised
+            # count; anything in the first tenth is far likelier to be `@creation`
+            # having gone missing everywhere, and calling that "complete" would
+            # licence reconcile.py to deactivate the portal.
+            tail_floor = max(self.RESULT_TAIL_PAGES_TO_STOP,
+                             int(last_page * self.RESULT_TAIL_MIN_DEPTH_SHARE))
+            dated_pages = 0
             for page in range(2, last_page + 1):
-                _, new_count = self.process_page_strategy(category, location, page)
+                _, new_count, is_tail = self.process_page_strategy(category, location, page)
+
+                if is_tail:
+                    # Undated entries sort behind every dated one, so this is the
+                    # portal running out of listings rather than a bad page. It
+                    # ends the category successfully: the pages behind it hold
+                    # nothing we store, so never visiting them costs no
+                    # `last_seen_at` and must not cost the sweep its `complete`.
+                    tail_streak += 1
+                    with self._tally_lock:
+                        self._pages_tail += 1
+                    # Three conditions, and the third is the one that is not
+                    # obvious: we must have *harvested* at least as many dated
+                    # pages as the floor demands. Depth alone can be reached by
+                    # skipping — a run where `@creation` vanished from page 2
+                    # onwards would arrive at the floor having stored one page and
+                    # then declare the category fully swept. Requiring real dated
+                    # pages means the shortcut is only ever taken by a crawl that
+                    # actually found an inventory to shorten.
+                    if (tail_streak >= self.RESULT_TAIL_PAGES_TO_STOP
+                            and page >= tail_floor
+                            and dated_pages >= tail_floor):
+                        self.logger.info(
+                            f"Result tail reached at page {page} of {last_page} for "
+                            f"{location}: {tail_streak} consecutive pages of intact but "
+                            f"undated entries, past the {tail_floor}-page floor. The "
+                            f"dated inventory ends here; category counts as fully swept."
+                        )
+                        self._sweep_detail.append(
+                            f"tail at page {page}/{last_page} for {location}")
+                        break
+                    continue
+                tail_streak = 0
+
                 if new_count is None:
                     # Deep pages are where the bot walls live: DataDome starts
                     # blocking immowelt around page 45. A run streak of failures
@@ -300,6 +362,7 @@ class BaseFinder(ABC):
                         break
                     continue
                 consecutive_failures = 0
+                dated_pages += 1
                 location_new += new_count
             return True, location_new
 
@@ -313,7 +376,7 @@ class BaseFinder(ABC):
             if empty_streak >= self.NO_NEW_PAGES_TO_STOP:
                 return True, location_new
             for page in range(2, last_page + 1):
-                _, new_count = self.process_page_strategy(category, location, page)
+                _, new_count, _ = self.process_page_strategy(category, location, page)
                 if new_count is None:
                     continue
                 location_new += new_count
@@ -334,17 +397,26 @@ class BaseFinder(ABC):
                     for page in range(2, last_page + 1)
                 ]
                 for future in concurrent.futures.as_completed(futures):
-                    _, new_count = future.result()
+                    _, new_count, _ = future.result()
                     location_new += new_count or 0
 
         return True, location_new
 
-    def process_page_strategy(self, category, location, page) -> tuple[int, int | None]:
+    def process_page_strategy(self, category, location, page) -> tuple[int, int | None, bool]:
         """
         Builds URL, fetches HTML, parses listings, saves to DB.
-        Returns (total pages count, number of NEW listings on this page).
-        new_count is None when the page failed — so early-stop won't mistake a
-        failed fetch for "no new listings".
+        Returns (total pages count, number of NEW listings on this page, is_tail).
+        new_count is None when the page yielded nothing usable — so early-stop
+        won't mistake a failed fetch for "no new listings".
+
+        `is_tail` says the page held only well-formed but undated entries, which
+        on a newest-first crawl means the dated result set has ended. It is a
+        *report*, not a verdict: the page still comes back as new_count=None, so
+        anything that does not act on the flag keeps treating it as a bad page.
+        Only the sweep's pagination acts on it, and only after seeing it three
+        times running and deep enough into the category — see process_location.
+        That default matters, because it is what still fails a category whose
+        page 1 reads as tail, which is what a renamed `@creation` would look like.
         """
         url = self.build_url(category, location, page)
 
@@ -370,7 +442,14 @@ class BaseFinder(ABC):
             )
             with self._tally_lock:
                 self._pages_ok += 1
-            return pages_count, new_count
+            return pages_count, new_count, False
+
+        except ResultTailReachedError as e:
+            # Not a failure and not a listing page: the end of the dated results.
+            # Deliberately left out of both tallies — process_location books it as
+            # a tail page once it is sure, and as nothing at all if it is not.
+            self.logger.info(f"Tail page {page} for {location}: {e}")
+            return 0, None, True
 
         except Exception as e:
             self.logger.error(f"Failed page {page} for {location} (URL: {url}): {e}")
@@ -380,7 +459,7 @@ class BaseFinder(ABC):
             with self._tally_lock:
                 self._pages_failed += 1
                 self._failed_pages.append((category, location, page))
-            return 0, None
+            return 0, None, False
 
     # --- Abstract Methods ---
 

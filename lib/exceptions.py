@@ -49,6 +49,34 @@ class StructureChangedError(ScrapeError):
         self.detail = detail
 
 
+class ResultTailReachedError(ScrapeError):
+    """Raised when a result page holds only well-formed but *undated* entries.
+
+    Not a defect — the end of the result set. Immoscout is crawled newest-first
+    (`sorting=2`), which sorts on the creation date, so every entry that has no
+    `@creation` is pushed behind every entry that has one. Those undated entries
+    are real offers of a kind we deliberately do not store (`tenantNetwork`
+    exchange flats, `draftListing` drafts), and they form one contiguous block at
+    the very end of every category.
+
+    Measured on WOHNUNG_MIETEN, 2026-09-14: page 226 was 20/20 dated and all 20
+    already in the database; pages 230 and 300 were 0/20 dated and 0/20 in the
+    database. The portal advertises 518 pages for a live inventory that ends
+    around page 227.
+
+    Telling this apart from StructureChangedError is the whole point. Both look
+    like "nothing parsed": one means the listing set ran out, the other means a
+    field was renamed and we are about to lose everything. The discriminator is
+    that a tail entry is otherwise intact — it keeps `@id`, `@modification` and
+    its `resultlist.realEstate` body, and only the creation date is absent.
+    """
+
+    def __init__(self, item_name: str, detail: str):
+        super().__init__(f'Result tail reached in "{item_name}": {detail}')
+        self.item_name = item_name
+        self.detail = detail
+
+
 class InactiveListingError(ScrapeError):
     """Raised when a listing is inactive."""
 

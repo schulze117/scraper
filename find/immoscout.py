@@ -4,7 +4,12 @@ from typing import Any
 from bs4 import BeautifulSoup, Tag
 from lib.config import get_config, resolve_proxy
 from lib.models import IMMOSCOUT_SEARCH_CATEGORIES, ListingSource, NewListing
-from lib.exceptions import ElementNotFoundError, NotBeautifulSoupError, StructureChangedError
+from lib.exceptions import (
+    ElementNotFoundError,
+    NotBeautifulSoupError,
+    ResultTailReachedError,
+    StructureChangedError,
+)
 from .base import BaseFinder, run_finder
 
 config = get_config()
@@ -15,6 +20,40 @@ REQUIRED_LISTING_KEYS = frozenset({"@id", "@modification", "@creation"})
 
 def has_listing_keys(entry: Any) -> bool:
     return isinstance(entry, dict) and REQUIRED_LISTING_KEYS <= entry.keys()
+
+# What an entry keeps when it is merely undated rather than broken: its id, its
+# edit date and its body. Only `@creation` is missing.
+TAIL_LISTING_KEYS = frozenset({"@id", "@modification", "resultlist.realEstate"})
+
+def is_undated_entry(entry: Any) -> bool:
+    """A well-formed result entry that simply carries no creation date.
+
+    These are real offers — `tenantNetwork` exchange flats and `draftListing`
+    drafts — and because the crawl sorts newest-first on exactly that date, they
+    all land behind every dated listing. So a page made entirely of them is the
+    end of the result set, not a parser problem. Requiring the rest of the entry
+    to be intact is what keeps this apart from `@creation` being renamed away:
+    a rename leaves the body intact too, but it would strike page 1 as readily as
+    page 300, which is why BaseFinder also demands depth before believing this.
+    """
+    return (isinstance(entry, dict)
+            and "@creation" not in entry
+            and TAIL_LISTING_KEYS <= entry.keys())
+
+def tail_markers(entries: list[Any]) -> str:
+    """Which undated kinds this page held — logged, never used as the condition.
+
+    `tenantNetwork` and `draftListing` are the two we have seen. Reading them out
+    means a third kind shows up in the logs the day it appears, without the
+    detection depending on a list we would have to keep current.
+    """
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        kind = next((k for k in ("tenantNetwork", "draftListing", "project") if entry.get(k)), "untagged")
+        counts[kind] = counts.get(kind, 0) + 1
+    return ", ".join(f"{n}x {k}" for k, n in sorted(counts.items()))
 
 def get_similar_entries(entry: dict[str, Any]) -> list[Any]:
     """The similarObject dicts nested under one result entry.
@@ -144,6 +183,20 @@ class ImmoscoutFinder(BaseFinder):
                     skipped += 1
                     continue
                 listings.append(extract_listing_data(similar_entry))
+
+        # Nothing parsed. That is either the end of the dated result set or a
+        # renamed field, and the two must not be confused: one is the crawl
+        # finishing, the other is the crawl silently losing everything.
+        #
+        # Undated-but-intact across the whole page says tail. BaseFinder decides
+        # whether to believe it — it wants three such pages in a row and real
+        # depth first, because a renamed `@creation` would make page 1 look
+        # exactly like this.
+        if not listings and result_entries and all(is_undated_entry(e) for e in result_entries):
+            raise ResultTailReachedError(
+                "resultlistEntry",
+                f"all {len(result_entries)} entries intact but undated ({tail_markers(result_entries)})",
+            )
 
         # Skipping a stray entry is routine; skipping every one of them is a
         # renamed field, and it must not pass as "no new listings" — that scores
