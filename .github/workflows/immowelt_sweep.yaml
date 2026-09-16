@@ -8,13 +8,15 @@ name: Run Immowelt Sweep
 # immoscout's: houses against flats, 178 vs 200 pages, because HAUS_KAUFEN alone
 # is 172 of the 378.
 #
-# Depth is the whole point here and also the whole risk: DataDome starts blocking
-# immowelt around page 45, which is exactly why the incremental finder caps at
-# MAX_PAGES=20. A sweep that gets blocked deep costs the pages behind the block
-# and nothing else — it records complete=false and reconcile.py then does nothing
-# for the source at all, rather than deactivating what the crawl never reached. A
-# sweep that takes the incremental finder's IP down with it would cost far more,
-# hence the separate slot in the crontab.
+# Depth is the whole point here and also the whole risk: from a GitHub runner IP
+# DataDome walls the sweep around page 45, which is why the incremental finder
+# caps at MAX_PAGES=20 and why this workflow never completed a category. The
+# residential exit removes that wall entirely — 174/174 pages, zero blocks, on
+# run 34883536366 (2026-09-14) — so use_proxy defaults to true here.
+#
+# A sweep that does get blocked deep costs the pages behind the block and nothing
+# else: it records complete=false and reconcile.py then does nothing for the
+# source at all, rather than deactivating what the crawl never reached.
 on:
   workflow_dispatch:
     inputs:
@@ -25,7 +27,7 @@ on:
       use_proxy:
         description: 'Route through the AI-server residential proxy over Tailscale'
         required: false
-        default: false
+        default: true
         type: boolean
       retry_count:
         description: 'Bot detection retry attempt'
@@ -46,16 +48,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
-    # Off by default, unlike immoscout. immowelt has always run direct from the
-    # GitHub runner and DataDome tolerates that far better than immoscout's WAF
-    # tolerates a datacenter IP -- but it still walls the sweep at page 49 of
-    # 172, which is the one thing that keeps immowelt out of reconcile.py. This
-    # switch exists to test whether the residential exit clears that wall.
+    # On by default since 2026-09-16. Direct from a GitHub runner this sweep
+    # aborted at page 48-49 of 172 every time and recorded complete=false, which
+    # is what kept immowelt out of reconcile.py; through the residential exit the
+    # same category walked all 174 pages with zero blocks.
     #
-    # It is a shared resource: the same AI server carries immoscout find and
-    # scrape, and the crontab keeps those two apart on purpose. A proxied
-    # immowelt sweep is a third user of it, so check what else holds it before
-    # dispatching one -- ../ecosystem.md#schedules.
+    # The proxy is a shared resource: the same AI server carries immoscout find
+    # and scrape and the immoscout sweep, and the crontab keeps all of them apart
+    # on purpose -- this one has the 06:00 slot. Check what else holds it before
+    # dispatching an off-schedule run -- ../ecosystem.md#schedules.
     env:
       USE_PROXY: ${{ inputs.use_proxy }}
 
