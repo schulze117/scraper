@@ -12,6 +12,14 @@ class KleinanzeigenFinder(BaseFinder):
     LISTINGS_PER_PAGE = 25
     CONCURRENT_LOCATIONS = True
     BASE_URL = "https://www.kleinanzeigen.de/"
+    # The slug segment every search URL needs. Kleinanzeigen dropped the
+    # slug-less form on 2026-09-17 -- /c203l4772 used to redirect to the
+    # canonical URL and now 404s, which stalled the finder for six hours on
+    # nothing but retries. The segment's content is ignored (the portal serves
+    # the category named by the id even when the slug contradicts it), but it
+    # must be present and must start with "s-". This is the slug the portal's
+    # own `rel=canonical` carries, and it is the same for all four categories.
+    SEARCH_PATH = "s-immobilien"
 
     def __init__(self):
         method = config.find.kleinanzeigen.method
@@ -31,7 +39,7 @@ class KleinanzeigenFinder(BaseFinder):
 
     def build_url(self, category_id, location, page):
         page_path = f"seite:{page}/" if page > 1 else ""
-        return f"{self.BASE_URL}/{page_path}c{category_id}l{location}"
+        return f"{self.BASE_URL}{self.SEARCH_PATH}/{page_path}c{category_id}l{location}"
 
     def get_listings(self, soup: BeautifulSoup) -> list[NewListing]:
         entries_list = soup.find("ul", attrs={"id": "srchrslt-adtable"})
@@ -59,10 +67,17 @@ class KleinanzeigenFinder(BaseFinder):
         return listings
 
     def get_pages_count(self, soup: BeautifulSoup) -> int:
-        total_listings_tag = soup.find("span", class_="breadcrump-summary")
+        # Renamed in the same 2026-09-17 relaunch that killed the slug-less URL:
+        # the result counter used to be span.breadcrump-summary and is now
+        # #srp-breadcrumb-summary (the typo fixed along with it). Matched on the
+        # id alone, not the tag, because the new markup is Tailwind-generated and
+        # its classes look generated too -- the id is the only stable handle.
+        # The text it carries is unchanged apart from a leading range:
+        # "1 - 25 von 52 Mietwohnungen in ...", so the parsing below still holds.
+        total_listings_tag = soup.find(id="srp-breadcrumb-summary")
 
         if not total_listings_tag:
-            raise ElementNotFoundError("span.breadcrump-summary")
+            raise ElementNotFoundError("#srp-breadcrumb-summary")
         if type(total_listings_tag) != Tag:
             raise NotBeautifulSoupError("total_listings_tag")
         if "Es wurden keine" in total_listings_tag.get_text():
