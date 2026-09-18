@@ -293,7 +293,7 @@ def probe_proxy(ip: str, url: str) -> bool:
 
     proxy_url = f"http://{ip}:{PROXY_PORT}"
     try:
-        html = get_html_seleniumbase(url, proxy_url=proxy_url, exit_on_block=False)
+        html = get_html_seleniumbase(url, proxy_url=proxy_url, on_block="return")
     except Exception as e:
         logger.warning(f"probe via {ip} errored: {e}")
         return False

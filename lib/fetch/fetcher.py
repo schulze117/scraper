@@ -5,7 +5,8 @@ from lib.fetch._seleniumbase import get_html_seleniumbase
 from lib.proxy import FirewallManager
 
 from lib.config import get_config, env_bool
-from lib.helpers import expand_proxy_url, redact_proxy
+from lib.exceptions import BotDetectedError
+from lib.helpers import expand_proxy_url, has_bot_detection, redact_proxy
 from lib.logger import get_logger
 
 config = get_config()
@@ -53,17 +54,24 @@ class Fetcher:
         proxy_url = expand_proxy_url(self.proxy_url) if self.proxy_url else None
 
         if self.method == "curl_cffi":
-            return get_html_curlcffi(url, proxy_url=proxy_url)
+            html = get_html_curlcffi(url, proxy_url=proxy_url)
+            # curl_cffi has no challenge-solving stage to notice a block, and a
+            # WAF that answers 200 with a shim slips past the status check. Judge
+            # it here so this path cannot hand a block page to a parser either.
+            if has_bot_detection(html):
+                raise BotDetectedError(url, len(html))
+            return html
 
         elif self.method == "playwright":
             raise NotImplementedError("Playwright fetcher is not yet implemented.")
 
         elif self.method == "seleniumbase":
-            # exit_on_block=False: a blocked page must not os._exit and kill the
-            # whole finder/scraper run — it returns the blocked HTML, the parser
-            # fails, and the caller logs + skips that one page.
+            # on_block="raise": a blocked page must not os._exit and kill the
+            # whole finder/scraper run, but it must not be returned as content
+            # either. It used to be, and the parser's "no <main> section" then
+            # read as "the ad is gone" — see BotDetectedError.
             return get_html_seleniumbase(
-                url, proxy_url=proxy_url, ready_marker=ready_marker, exit_on_block=False
+                url, proxy_url=proxy_url, ready_marker=ready_marker, on_block="raise"
             )
 
         else:

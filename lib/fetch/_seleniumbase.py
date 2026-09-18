@@ -3,9 +3,16 @@ import os
 import threading
 
 from seleniumbase import sb_cdp
-from tenacity import retry, stop_after_attempt, wait_fixed, before_sleep_log
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+)
 from lib.config import get_config
 from lib.logger import get_logger
+from lib.exceptions import BotDetectedError
 from lib.helpers import get_network_error, has_bot_detection
 from lib.exceptions import FetchNetworkError
 
@@ -193,6 +200,11 @@ def _build_chrome_kwargs(proxy_url: str | None) -> dict:
     stop=stop_after_attempt(config.seleniumbase.max_retries),
     wait=wait_fixed(config.seleniumbase.retry_delay),
     reraise=True,
+    # A block already cost BOT_SOLVE_ATTEMPTS rounds of wait-reload-solve inside
+    # the fetch; running the whole thing again buys nothing and triples the time
+    # the caller needs to notice a wall. At ~2 min per blocked listing that is
+    # the difference between spotting a block in minutes and in half an hour.
+    retry=retry_if_not_exception_type(BotDetectedError),
     before_sleep=before_sleep_log(logger, _LOG_LEVEL_INT)
 )
 def get_html_seleniumbase(
@@ -200,7 +212,7 @@ def get_html_seleniumbase(
     proxy_url: str | None = None,
     timeout: int | None = None,
     screenshot_path: str | None = None,
-    exit_on_block: bool = True,
+    on_block: str = "exit",
     ready_marker: str | None = None,
 ) -> str:
     """Fetch a page with Pure CDP Mode (undetected Chromium) and return its HTML.
@@ -210,10 +222,18 @@ def get_html_seleniumbase(
     on a fresh runner IP. `screenshot_path`, when given, saves a PNG of the final
     page — used by the lib.fetch.fetch_url test harness (no overhead in production).
 
-    `exit_on_block=False` turns off the os._exit(42): on a persistent block it
-    returns the (still-blocked) HTML instead, so a caller can judge it with
-    has_bot_detection() without the process dying. Used by the pipeline (a blocked
-    page must not kill the run) and the GCP-proxy probe.
+    `on_block` decides what a persistent block does, and the three callers want
+    three different things:
+
+      "exit"   os._exit(42) -- the fetch_url harness, where the run IS the probe.
+      "raise"  BotDetectedError -- the pipeline. A block must not kill the run
+               (one bad IP would cost the whole queue), but it must also never
+               be mistaken for content: returning the blocked HTML is what let
+               the scrapers read it as a deleted listing and deactivate 19 live
+               ones on 2026-09-17. Raising makes that confusion impossible, and
+               the caller counts the blocks and decides when to give up.
+      "return" the blocked HTML verbatim -- the GCP-proxy probe, whose whole job
+               is to look at it and judge the IP.
 
     The actual work runs on a daemon thread with a hard wall-clock cap. A CDP call
     (get_page_source/reload) can block forever when the proxied connection stalls
@@ -227,7 +247,7 @@ def get_html_seleniumbase(
     def _worker():
         try:
             box["html"] = _fetch_body(
-                holder, url, proxy_url, timeout, screenshot_path, exit_on_block, ready_marker
+                holder, url, proxy_url, timeout, screenshot_path, on_block, ready_marker
             )
         except BaseException as e:  # noqa: BLE001 — surface any failure to the caller
             box["error"] = e
@@ -255,7 +275,7 @@ def _fetch_body(
     proxy_url: str | None,
     timeout: int | None,
     screenshot_path: str | None,
-    exit_on_block: bool,
+    on_block: str,
     ready_marker: str | None,
 ) -> str:
     """The real fetch. Runs inside the timeout thread; publishes its browser to
@@ -318,12 +338,18 @@ def _fetch_body(
                     # os._exit below kills the process before the caller can
                     # write anything, so persist the block-page HTML here too.
                     _save_html(html, os.path.splitext(screenshot_path)[0] + ".html")
-                if not exit_on_block:
+                if on_block == "return":
                     logger.warning(
                         f"Bot detection persists for {url} after {BOT_SOLVE_ATTEMPTS} "
                         f"attempts (len {len(html)}); returning blocked HTML (probe mode)."
                     )
                     return html
+                if on_block == "raise":
+                    logger.warning(
+                        f"Bot detection persists for {url} after {BOT_SOLVE_ATTEMPTS} "
+                        f"attempts (len {len(html)}); raising."
+                    )
+                    raise BotDetectedError(url, len(html))
                 logger.error(
                     f"Bot detection persists after {BOT_SOLVE_ATTEMPTS} solve+reload attempts "
                     f"for {url}. HTML length: {len(html)}. Stopping program."

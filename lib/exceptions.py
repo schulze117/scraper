@@ -121,6 +121,25 @@ class FetchNetworkError(Exception):
         self.code = code
 
 
+class BotDetectedError(Exception):
+    """Raised when the portal served an anti-bot block page instead of content.
+
+    The distinction from every other fetch failure is the whole point. A block
+    page parses like a deleted listing -- no <main>, no JSON -- and the scrapers
+    read a missing main section as "the ad is gone" and deactivate. On
+    2026-09-17 that turned a 40-minute DataDome wall into 19 listings marked
+    offline that nobody had ever looked at.
+
+    So a block must never reach a parser. It is raised here, and
+    `is_deactivated_listing` is never consulted for it.
+    """
+
+    def __init__(self, url: str, html_len: int):
+        super().__init__(f"Bot detection page served for {url} (len {html_len})")
+        self.url = url
+        self.html_len = html_len
+
+
 class FinderFailedError(Exception):
     """Raised at the end of a find run that lost one or more categories.
 

@@ -1,4 +1,6 @@
 import concurrent.futures
+import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -7,7 +9,7 @@ from bs4 import BeautifulSoup
 
 from lib.config import env_get, get_config
 from lib.database import Database
-from lib.exceptions import InactiveListingError
+from lib.exceptions import BotDetectedError, InactiveListingError
 from lib.fetch.fetcher import Fetcher
 from lib.logger import get_logger
 from lib.models import ListingSource, NextListingModel
@@ -47,6 +49,20 @@ class BaseScraper(ABC):
     # `0` means unlimited, which is what a local drain wants.
     TIME_BUDGET_MIN = 270
 
+    # Consecutive blocked fetches that end the run with exit 42, which the
+    # workflow answers by re-dispatching onto a fresh runner IP (up to 15 times).
+    #
+    # The number has to separate two things that look identical for one listing:
+    # a portal having a bad moment with us, and the portal having decided about
+    # this IP. One block is noise -- the listing is skipped, stays queued, and
+    # the next one usually succeeds. Several in a row is a wall, and every fetch
+    # after it is wasted: on 2026-09-17 immowelt blocked 19 in a row over 40
+    # minutes and the run would have kept going for another four hours.
+    #
+    # Deliberately low. The cost of stopping early is one re-dispatch; the cost
+    # of continuing is a queue drained against a wall.
+    BOT_BLOCKS_TO_ABORT = 4
+
     def __init__(self, source: ListingSource, method: str, proxy_url: str | None):
         self.source = source
         self.config = get_config()
@@ -55,6 +71,10 @@ class BaseScraper(ABC):
         self.fetcher = Fetcher(method=method, proxy_url=proxy_url)
         method_config = getattr(self.config, method)
         self.max_workers = method_config.max_workers
+        # Consecutive blocks, reset by any successful fetch. Touched from several
+        # threads when CONCURRENT_LISTINGS is on, so it takes the lock.
+        self._consecutive_blocks = 0
+        self._block_lock = threading.Lock()
 
     def _time_budget_s(self) -> float:
         """Seconds of wall clock this run may use; 0 for unlimited.
@@ -148,6 +168,10 @@ class BaseScraper(ABC):
         prefix = f"{listing.id}  {url}"
         try:
             html = self.fetcher.fetch(url, ready_marker=self.READY_MARKER)
+            # Reset here, not after a successful scrape: the counter measures
+            # blocked fetches, and a page that came back but parsed as a deleted
+            # ad is still proof that the portal is talking to us.
+            self._note_fetch_ok()
             soup = BeautifulSoup(html, "lxml")
 
             minified_html = self.get_minified_html(soup)
@@ -165,6 +189,13 @@ class BaseScraper(ABC):
             self.db.set_last_scraped(listing.id)
 
             self.logger.info(f"{prefix}  Scraped successfully")
+
+        except BotDetectedError as e:
+            # Never a deactivation: we did not see the page, so we know nothing
+            # about whether the ad still exists. The listing stays queued and the
+            # next run picks it up.
+            self.logger.warning(f"{prefix}  Blocked, skipping (not deactivating): {e}")
+            self._note_block()
 
         except InactiveListingError:
             if listing.last_scraped_at is None:
@@ -184,6 +215,31 @@ class BaseScraper(ABC):
                     self.db.deactivate_listing(listing.id)
             else:
                 self.logger.error(f"{prefix}  Failed to scrape: {e}")
+
+    def _note_fetch_ok(self) -> None:
+        """A page came back. Whatever wall we were seeing is not there now."""
+        with self._block_lock:
+            self._consecutive_blocks = 0
+
+    def _note_block(self) -> None:
+        """Count a block and end the run once they stop looking like noise.
+
+        os._exit rather than an exception: this can run inside a worker thread,
+        where raising only kills that future and leaves the rest of the batch
+        fetching into the same wall. 42 is the code the workflow watches for --
+        it re-dispatches on a fresh IP instead of reporting a failure.
+        """
+        with self._block_lock:
+            self._consecutive_blocks += 1
+            n = self._consecutive_blocks
+        if n < self.BOT_BLOCKS_TO_ABORT:
+            self.logger.warning(f"Blocked fetch {n}/{self.BOT_BLOCKS_TO_ABORT} in a row.")
+            return
+        self.logger.error(
+            f"{n} blocked fetches in a row — this IP is walled. Stopping with exit 42 "
+            f"so the workflow retries on a fresh runner. Unscraped listings stay queued."
+        )
+        os._exit(42)
 
     # --- Abstract Methods ---
 
