@@ -1,8 +1,17 @@
 # scraper
 
-Automated listing discovery and scraping for German real estate portals. Runs on GitHub Actions.
+Findet Inserate auf Kleinanzeigen, Immobilienscout24 und Immowelt und speichert
+ihre Detailseiten roh in PostgreSQL. Läuft auf GitHub Actions.
 
-**Platforms**: Kleinanzeigen, Immoscout24, Immowelt
-**Pipeline**: Find → Scrape → PostgreSQL (`raw_data`)
+```
+Find  → Suchseiten durchgehen, neue Inserat-IDs anlegen
+Scrape → Detailseiten holen, HTML und JSON speichern
+```
 
-See [workflow.md](workflow.md) for setup and operations, [CLAUDE.md](CLAUDE.md) for architecture and code conventions.
+Alles Weitere — Strukturieren, Geodaten, Bewertung — passiert in anderen
+Diensten der Fixfolio-Pipeline.
+
+- Aufbau und Konventionen: [CLAUDE.md](CLAUDE.md)
+- Einrichten und Betrieb: [workflow.md](workflow.md)
+
+Zugangsdaten liegen nicht im Repo. `.env.template` zeigt, was gesetzt sein muss.
