@@ -364,7 +364,10 @@ def _fetch_body(
         if screenshot_path:
             _save_screenshot(sb, screenshot_path)
         return html
-    except SystemExit:
+    # The two typed failures must reach the caller as themselves. Wrapped into a
+    # RuntimeError, as everything else is, the scraper's block counter never saw
+    # a block and a dead proxy looked like any other failed listing.
+    except (SystemExit, BotDetectedError, FetchNetworkError):
         raise
     except Exception as e:
         logger.error(f"Failed to fetch {url} with SeleniumBase: {e}")

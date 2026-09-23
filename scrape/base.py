@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 from lib.config import env_get, get_config
 from lib.database import Database
-from lib.exceptions import BotDetectedError, InactiveListingError
+from lib.exceptions import BotDetectedError, FetchNetworkError, InactiveListingError
 from lib.fetch.fetcher import Fetcher
 from lib.logger import get_logger
 from lib.models import ListingSource, NextListingModel
@@ -63,6 +63,14 @@ class BaseScraper(ABC):
     # of continuing is a queue drained against a wall.
     BOT_BLOCKS_TO_ABORT = 4
 
+    # Consecutive listings the browser could not reach at all (FetchNetworkError:
+    # a dead proxy tunnel, DNS, no route) that end the run with exit 1. Not 42:
+    # a new runner does not bring a proxy back. Each one has already been retried
+    # inside the fetch, so five in a row is ~10 minutes of nothing. On 2026-09-23,
+    # with the AI server that hosts the proxy powered off, immoscout ran its full
+    # budget twice, got 0 of 82 and ended green.
+    NETWORK_ERRORS_TO_ABORT = 5
+
     def __init__(self, source: ListingSource, method: str, proxy_url: str | None):
         self.source = source
         self.config = get_config()
@@ -74,6 +82,7 @@ class BaseScraper(ABC):
         # Consecutive blocks, reset by any successful fetch. Touched from several
         # threads when CONCURRENT_LISTINGS is on, so it takes the lock.
         self._consecutive_blocks = 0
+        self._consecutive_unreachable = 0
         self._block_lock = threading.Lock()
 
     def _time_budget_s(self) -> float:
@@ -197,6 +206,11 @@ class BaseScraper(ABC):
             self.logger.warning(f"{prefix}  Blocked, skipping (not deactivating): {e}")
             self._note_block()
 
+        except FetchNetworkError as e:
+            # Nor this: we never reached the portal.
+            self.logger.error(f"{prefix}  Unreachable, skipping: {e}")
+            self._note_unreachable()
+
         except InactiveListingError:
             if listing.last_scraped_at is None:
                 self.logger.info(f"{prefix}  Never scraped, deleting (inactive listing)")
@@ -220,6 +234,7 @@ class BaseScraper(ABC):
         """A page came back. Whatever wall we were seeing is not there now."""
         with self._block_lock:
             self._consecutive_blocks = 0
+            self._consecutive_unreachable = 0
 
     def _note_block(self) -> None:
         """Count a block and end the run once they stop looking like noise.
@@ -240,6 +255,22 @@ class BaseScraper(ABC):
             f"so the workflow retries on a fresh runner. Unscraped listings stay queued."
         )
         os._exit(42)
+
+    def _note_unreachable(self) -> None:
+        """Count a listing the browser never reached; end the run on a streak.
+
+        os._exit for the same reason as `_note_block`.
+        """
+        with self._block_lock:
+            self._consecutive_unreachable += 1
+            n = self._consecutive_unreachable
+        if n < self.NETWORK_ERRORS_TO_ABORT:
+            return
+        self.logger.error(
+            f"{n} listings in a row unreachable — the proxy or the network is down. "
+            f"Stopping with exit 1. Unscraped listings stay queued."
+        )
+        os._exit(1)
 
     # --- Abstract Methods ---
 
