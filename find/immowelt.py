@@ -7,7 +7,7 @@ from lzstring import LZString
 
 from lib.logger import get_logger
 from lib.config import get_config, resolve_proxy
-from lib.exceptions import ElementNotFoundError, NotBeautifulSoupError
+from lib.exceptions import ElementNotFoundError, NotBeautifulSoupError, StructureChangedError
 from lib.models import IMMOWELT_SEARCH_CATEGORIES, ListingSource, NewListing
 from .base import BaseFinder, run_finder
 
@@ -15,6 +15,15 @@ config = get_config()
 logger = get_logger("immowelt")
 
 lz = LZString()
+
+# Everything extract_listing_data needs from an entry's `metadata`. An entry
+# missing one of them is skipped and counted, not fatal -- one crooked object
+# must not cost the page.
+REQUIRED_METADATA_KEYS = ("id", "updateDate", "creationDate")
+
+def has_listing_metadata(entry: Any) -> bool:
+    metadata = entry.get("metadata") if isinstance(entry, dict) else None
+    return isinstance(metadata, dict) and all(metadata.get(k) for k in REQUIRED_METADATA_KEYS)
 
 
 class ImmoweltFinder(BaseFinder):
@@ -31,7 +40,10 @@ class ImmoweltFinder(BaseFinder):
     STOP_WHEN_NO_NEW = True
     NO_NEW_PAGES_TO_STOP = 3
     MAX_PAGES = 20
-
+    # A results page holds 30 entries, 40 for HAUS_KAUFEN (measured 2026-09-24).
+    # A page this full cannot be a one-page result set -- see get_pages_count.
+    # The smaller of the two, so the check covers every category.
+    FULL_PAGE_ENTRIES = 30
 
     def __init__(self):
         method = config.find.immowelt.method
@@ -66,14 +78,61 @@ class ImmoweltFinder(BaseFinder):
             raise ValueError("Failed to decode JSON data from the script tag.")
         return json.loads(decoded)
 
+    def get_result_entries(self, soup: BeautifulSoup) -> dict[str, dict[str, Any]]:
+        """The page's `classifiedsData`, keyed by listing id.
+
+        Read strictly. The `.get()` chain this replaced turned a renamed key into
+        `{}`, which scores as "no new listings", feeds the early stop and exits
+        green.
+
+        Empty is still a real answer: a search without hits carries
+        `classifiedsData: {}`. It is believed only while `classifieds`, the
+        page's own list of ids, is empty too -- ids without data means the data
+        moved. The two do not match one to one: the last page of HAUS_KAUFEN
+        listed 17 ids for 16 entries on 2026-09-24. So a last page holding
+        nothing but such an orphan trips this falsely, which costs one sweep its
+        `complete`; the silent version costs the whole crawl.
+        """
+        page_props = self.get_json_data(soup).get("pageProps")
+        if not isinstance(page_props, dict):
+            raise StructureChangedError("pageProps", "missing from classified-serp-init-data")
+        entries = page_props.get("classifiedsData")
+        if not isinstance(entries, dict):
+            raise StructureChangedError("pageProps.classifiedsData", f"missing or not a dict ({type(entries).__name__})")
+        if not entries and page_props.get("classifieds"):
+            raise StructureChangedError(
+                "pageProps.classifiedsData",
+                f"empty, but `classifieds` lists {len(page_props['classifieds'])} ids for this page",
+            )
+        return entries
+
     def get_listings(self, soup: BeautifulSoup) -> list[NewListing]:
-        json_data = self.get_json_data(soup)
-        result_entries: dict[str, dict[str, Any]] = json_data.get("pageProps", {}).get("classifiedsData", {})
+        result_entries = self.get_result_entries(soup)
+        if not result_entries:
+            self.logger.warning("No listings found on this page, skipping")
+            return []
+
         listings: list[NewListing] = []
+        skipped = 0
         for entry in result_entries.values():
-            if "metadata" not in entry:
+            if not has_listing_metadata(entry):
+                skipped += 1
                 continue
             listings.append(extract_listing_data(entry["metadata"]))
+
+        # Skipping a stray entry is routine; skipping every one of them is a
+        # renamed field, and it must not pass as "no new listings".
+        if not listings:
+            raise StructureChangedError(
+                "classifiedsData",
+                f"{len(result_entries)} entries on the page, none with metadata {list(REQUIRED_METADATA_KEYS)}",
+            )
+        if skipped:
+            self.logger.warning(
+                f"Skipped {skipped} unparsable entries of {len(result_entries)} on the page "
+                f"(metadata without {list(REQUIRED_METADATA_KEYS)}) — a rising share is the "
+                f"warning before it reaches all of them."
+            )
         return listings
 
     def get_pages_count(self, soup: BeautifulSoup) -> int:
@@ -83,11 +142,24 @@ class ImmoweltFinder(BaseFinder):
         if type(pagination_buttons_container) != Tag:
             raise NotBeautifulSoupError("pagination_buttons_container")
         pagination_buttons = pagination_buttons_container.find_all("button")
-        if len(pagination_buttons) < 2:
-            self.logger.warning("No pagination buttons found, assuming only one page")
-            return 1
-        last_page_number = int(pagination_buttons[-2].get_text(strip=True))
-        return last_page_number
+        if len(pagination_buttons) >= 2:
+            return int(pagination_buttons[-2].get_text(strip=True))
+
+        # The nav is there but holds no page buttons: either the result set fits
+        # on one page (a single-page search renders the nav empty), or the
+        # buttons became something else and every page behind page 1 is about to
+        # go unvisited while the run stays green. A full page cannot be the
+        # first case. Same trade as immoscout: a category with exactly one full
+        # page of hits trips this falsely once.
+        entry_count = len(self.get_result_entries(soup))
+        if entry_count >= self.FULL_PAGE_ENTRIES:
+            raise StructureChangedError(
+                "serp-pagination-testid",
+                f"{entry_count} entries on the page but fewer than two pagination buttons",
+            )
+
+        self.logger.info(f"No pagination buttons, {entry_count} entries — single-page result set.")
+        return 1
 
 
 def extract_listing_data(listing: dict[str, str]) -> NewListing:

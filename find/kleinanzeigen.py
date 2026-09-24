@@ -2,10 +2,15 @@ from bs4 import BeautifulSoup, Tag
 from lib.config import get_config, resolve_proxy
 from lib.database import Database
 from lib.models import KLEINANZEIGEN_SEARCH_CATEGORIES, ListingSource, NewListing
-from lib.exceptions import ElementNotFoundError, NotBeautifulSoupError
+from lib.exceptions import ElementNotFoundError, NotBeautifulSoupError, StructureChangedError
 from .base import BaseFinder, run_finder
 
 config = get_config()
+
+# What the result counter says when a search has no hits. The result list is then
+# left out of the page altogether -- that is the one case where a missing list
+# is not a structure change.
+EMPTY_SEARCH_MARKER = "Es wurden keine"
 
 class KleinanzeigenFinder(BaseFinder):
     SOURCE = ListingSource.KLEINANZEIGEN
@@ -41,20 +46,34 @@ class KleinanzeigenFinder(BaseFinder):
         page_path = f"seite:{page}/" if page > 1 else ""
         return f"{self.BASE_URL}{self.SEARCH_PATH}/{page_path}c{category_id}l{location}"
 
+    def is_empty_search(self, soup: BeautifulSoup) -> bool:
+        counter = soup.find(id="srp-breadcrumb-summary")
+        return isinstance(counter, Tag) and EMPTY_SEARCH_MARKER in counter.get_text()
+
     def get_listings(self, soup: BeautifulSoup) -> list[NewListing]:
         entries_list = soup.find("ul", attrs={"id": "srchrslt-adtable"})
 
+        # Returning [] here used to cover every reason the list might be missing,
+        # and [] scores as "no new listings" -- a renamed list would have run
+        # green with nothing found. A search without hits leaves the list out
+        # and says so in the counter (the "Umkreis" list that shows up instead is
+        # #srchrslt-adtable-altads and never was ours); any other page without it
+        # is the markup having moved.
         if not entries_list:
-            return []
+            if self.is_empty_search(soup):
+                return []
+            raise StructureChangedError(
+                "ul#srchrslt-adtable", "no result list, and the counter does not report an empty search")
         if type(entries_list) != Tag:
             raise NotBeautifulSoupError("entries_list")
 
         listings: list[NewListing] = []
+        skipped = 0
 
         for entry in entries_list.find_all("article", attrs={"data-adid": True}):
             external_id = entry.get("data-adid")
             if not external_id:
-                self.logger.warning(f"No data-adid found in entry: {entry}")
+                skipped += 1
                 continue
             listing = NewListing(external_id=external_id, source=ListingSource.KLEINANZEIGEN)
 
@@ -63,6 +82,20 @@ class KleinanzeigenFinder(BaseFinder):
                 continue
 
             listings.append(listing)
+
+        # The list is only rendered when there are hits, so a list with nothing
+        # readable in it is a renamed attribute or tag, not a quiet page.
+        if not listings:
+            raise StructureChangedError(
+                "article[data-adid]",
+                f"result list present with {len(entries_list.find_all('article'))} articles, "
+                f"none carrying a data-adid",
+            )
+        if skipped:
+            self.logger.warning(
+                f"Skipped {skipped} entries without a data-adid on the page — a rising share "
+                f"is the warning before it reaches all of them."
+            )
 
         return listings
 
@@ -80,17 +113,22 @@ class KleinanzeigenFinder(BaseFinder):
             raise ElementNotFoundError("#srp-breadcrumb-summary")
         if type(total_listings_tag) != Tag:
             raise NotBeautifulSoupError("total_listings_tag")
-        if "Es wurden keine" in total_listings_tag.get_text():
+        if self.is_empty_search(soup):
             return 0
 
         total_listings_text = total_listings_tag.get_text(strip=True)
         if not total_listings_text:
             raise ValueError("Total listings text is empty")
 
+        # The counter is the only page count this portal gives us. An unreadable
+        # one used to log and answer 0, which ends the location after page 1
+        # while the run stays green -- the kleinanzeigen form of a full page
+        # without pagination. The empty search is handled above.
+        if "von " not in total_listings_text:
+            raise StructureChangedError("#srp-breadcrumb-summary", f"no 'von <n>' in {total_listings_text!r}")
         total_listings = total_listings_text.split("von ")[1].split(" ")[0].strip().replace(".", "")
         if not total_listings.isdigit():
-            self.logger.warning(f"Total listings is not a valid number, assuming 0: {total_listings}")
-            return 0
+            raise StructureChangedError("#srp-breadcrumb-summary", f"hit count {total_listings!r} is not a number")
 
         total_listings = int(total_listings)
         self.logger.debug(f"Total listings: {total_listings}")
