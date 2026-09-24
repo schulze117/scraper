@@ -71,6 +71,13 @@ class BaseScraper(ABC):
     # budget twice, got 0 of 82 and ended green.
     NETWORK_ERRORS_TO_ABORT = 5
 
+    # Consecutive listings that were fetched but failed to parse, ending the run
+    # with exit 1. One is a broken ad; a streak is the portal having changed its
+    # page. On 2026-09-23 immowelt renamed the key its page state sits under,
+    # and every run after failed every listing and ended green. In normal runs
+    # the longest streak is 0 (kleinanzeigen, 4 851 listings, 2026-09-24).
+    PARSE_FAILURES_TO_ABORT = 10
+
     def __init__(self, source: ListingSource, method: str, proxy_url: str | None):
         self.source = source
         self.config = get_config()
@@ -83,6 +90,7 @@ class BaseScraper(ABC):
         # threads when CONCURRENT_LISTINGS is on, so it takes the lock.
         self._consecutive_blocks = 0
         self._consecutive_unreachable = 0
+        self._consecutive_parse_failures = 0
         self._block_lock = threading.Lock()
 
     def _time_budget_s(self) -> float:
@@ -175,8 +183,10 @@ class BaseScraper(ABC):
         """Fetch, extract, and save data for a single listing."""
         url = self.build_url(listing.external_id)
         prefix = f"{listing.id}  {url}"
+        fetched = False
         try:
             html = self.fetcher.fetch(url, ready_marker=self.READY_MARKER)
+            fetched = True
             # Reset here, not after a successful scrape: the counter measures
             # blocked fetches, and a page that came back but parsed as a deleted
             # ad is still proof that the portal is talking to us.
@@ -198,6 +208,7 @@ class BaseScraper(ABC):
             self.db.set_last_scraped(listing.id)
 
             self.logger.info(f"{prefix}  Scraped successfully")
+            self._note_parsed()
 
         except BotDetectedError as e:
             # Never a deactivation: we did not see the page, so we know nothing
@@ -212,6 +223,7 @@ class BaseScraper(ABC):
             self._note_unreachable()
 
         except InactiveListingError:
+            self._note_parsed()
             if listing.last_scraped_at is None:
                 self.logger.info(f"{prefix}  Never scraped, deleting (inactive listing)")
                 self.db.delete_listing(listing.id)
@@ -229,6 +241,8 @@ class BaseScraper(ABC):
                     self.db.deactivate_listing(listing.id)
             else:
                 self.logger.error(f"{prefix}  Failed to scrape: {e}")
+                if fetched:
+                    self._note_parse_failure()
 
     def _note_fetch_ok(self) -> None:
         """A page came back. Whatever wall we were seeing is not there now."""
@@ -255,6 +269,27 @@ class BaseScraper(ABC):
             f"so the workflow retries on a fresh runner. Unscraped listings stay queued."
         )
         os._exit(42)
+
+    def _note_parsed(self) -> None:
+        """A fetched page was understood, as a listing or as a deleted one."""
+        with self._block_lock:
+            self._consecutive_parse_failures = 0
+
+    def _note_parse_failure(self) -> None:
+        """Count a page that came back but did not parse; end the run on a streak.
+
+        os._exit for the same reason as `_note_block`.
+        """
+        with self._block_lock:
+            self._consecutive_parse_failures += 1
+            n = self._consecutive_parse_failures
+        if n < self.PARSE_FAILURES_TO_ABORT:
+            return
+        self.logger.error(
+            f"{n} listings in a row failed to parse — the portal has likely changed "
+            f"its page. Stopping with exit 1. Unscraped listings stay queued."
+        )
+        os._exit(1)
 
     def _note_unreachable(self) -> None:
         """Count a listing the browser never reached; end the run on a streak.

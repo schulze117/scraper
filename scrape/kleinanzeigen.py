@@ -5,7 +5,7 @@ from typing import Any
 from bs4 import BeautifulSoup, Tag
 
 from lib.config import get_config, resolve_proxy
-from lib.exceptions import ElementDisabledError, ElementNotFoundError, NotBeautifulSoupError
+from lib.exceptions import ElementDisabledError, ElementNotFoundError, InactiveListingError, NotBeautifulSoupError
 from lib.models import ListingSource, NextListingModel
 from .base import BaseScraper
 
@@ -23,6 +23,13 @@ class KleinanzeigenScraper(BaseScraper):
         return f"{self.BASE_URL}/s-anzeige/{external_id}"
 
     def get_minified_html(self, soup: BeautifulSoup) -> str:
+        # A deleted ad redirects to the home page. The fetch does not hand back
+        # the final URL, but the page names itself: a live ad's canonical is its
+        # /s-anzeige/ URL, the home page's is the site root.
+        canonical = soup.find("link", rel="canonical")
+        if canonical is not None and "/s-anzeige/" not in (canonical.get("href") or ""):
+            raise InactiveListingError(f"redirected to {canonical.get('href')}")
+
         minified_html = soup.find("section", {"id": "viewad-main"})
 
         if minified_html is None:
@@ -120,9 +127,9 @@ class KleinanzeigenScraper(BaseScraper):
 
     def is_deactivated_listing(self, exception: Exception, listing: NextListingModel) -> bool:
         self.logger.debug(f"Checking if listing {listing.external_id} is deactivated due to: {exception}")
-        if listing and any(msg in str(exception) for msg in ["Main section", '"Contact button" is disabled']):
-            return True
-        return False
+        # Only on evidence from the ad page itself. A missing main section is not
+        # that -- a deleted ad is caught by its redirect in get_minified_html.
+        return bool(listing) and '"Contact button" is disabled' in str(exception)
 
 
 # --- Entry Point ---

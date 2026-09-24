@@ -160,9 +160,10 @@ class ImmoscoutScraper(BaseScraper):
 
     def is_deactivated_listing(self, exception: Exception, listing: NextListingModel) -> bool:
         self.logger.debug(f"Checking if listing {listing.external_id} is deactivated due to: {exception}")
-        if isinstance(exception, (GoneError, InactiveListingError)) or "Main section" in str(exception):
-            return True
-        return False
+        # Only on evidence the listing is gone (the status message, see
+        # get_minified_html). A missing #is24-content is a page that did not
+        # finish rendering.
+        return isinstance(exception, (GoneError, InactiveListingError))
 
 
 # --- Entry Point ---

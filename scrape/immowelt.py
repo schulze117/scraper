@@ -4,11 +4,17 @@ from typing import Any
 from bs4 import BeautifulSoup, Tag
 
 from lib.config import get_config, resolve_proxy
-from lib.exceptions import ElementNotFoundError, GoneError, NotBeautifulSoupError
+from lib.exceptions import ElementNotFoundError, GoneError, InactiveListingError, NotBeautifulSoupError
 from lib.models import ListingSource, NextListingModel
 from .base import BaseScraper
 
 config = get_config()
+
+# The key the page state sits under. immowelt renamed it on 2026-09-23; the new
+# one is stored under the old name, so extract and every earlier row read the
+# same shape.
+JSON_KEY = "app_cldp"
+JSON_KEY_RENAMED = "app_demand_referral_cldp"
 
 
 class ImmoweltScraper(BaseScraper):
@@ -27,6 +33,12 @@ class ImmoweltScraper(BaseScraper):
         return f"{self.BASE_URL}/expose/{external_id}"
 
     def get_minified_html(self, soup: BeautifulSoup) -> str:
+        # A deleted expose still renders <main class="Main">, so the page state
+        # is the only evidence: it answers 404 or 410 for the classified.
+        status = _classified_status(soup)
+        if status in (404, 410):
+            raise InactiveListingError(f"classified answered {status}")
+
         minified_html = soup.find("main", class_="Main")
 
         if minified_html is None:
@@ -75,6 +87,8 @@ class ImmoweltScraper(BaseScraper):
         )
 
         json_data = json.loads(json_data_str)
+        if JSON_KEY not in json_data and JSON_KEY_RENAMED in json_data:
+            json_data[JSON_KEY] = json_data.pop(JSON_KEY_RENAMED)
 
         if "app_cldp" not in json_data or not isinstance(json_data["app_cldp"], dict):
             raise ValueError(f"Invalid JSON data format: {json_data}")
@@ -82,9 +96,7 @@ class ImmoweltScraper(BaseScraper):
         return json_data
 
     def get_image_urls(self, soup: BeautifulSoup, json_data: dict[str, Any]) -> list[str]:
-        gallery: dict[str, Any] = (
-            json_data.get("app_cldp", {}).get("data", {}).get("classified", {}).get("sections", {}).get("gallery", {})
-        )
+        gallery = _gallery(json_data)
 
         if not gallery:
             self.logger.warning("No gallery section found in JSON data")
@@ -114,16 +126,14 @@ class ImmoweltScraper(BaseScraper):
 
         self.logger.warning("No headInfo section found in JSON data")
 
-        gallery: dict[str, Any] = (
-            json_data.get("app_cldp", {}).get("data", {}).get("classified", {}).get("sections", {}).get("gallery", {})
-        )
+        gallery = _gallery(json_data)
 
         if not gallery:
             self.logger.warning("No gallery section found in JSON data")
             return None
 
         for image in gallery.get("images", []) + gallery.get("floorplans", []):
-            if "url" in image and "alt" in image and image["alt"]:
+            if "url" in image and (image.get("alt") or image.get("description")):
                 return image["url"]
 
         self.logger.warning("No main image found in gallery section")
@@ -131,12 +141,33 @@ class ImmoweltScraper(BaseScraper):
 
     def is_deactivated_listing(self, exception: Exception, listing: NextListingModel) -> bool:
         self.logger.debug(f"Checking if listing {listing.external_id} is deactivated due to: {exception}")
-        if isinstance(exception, GoneError) or "Main section" in str(exception):
-            return True
-        return False
+        # Only on evidence the listing is gone. A missing <main> is not that: it
+        # is what a half-loaded page looks like, and a deleted expose has one.
+        return isinstance(exception, GoneError)
 
 
 # --- Helper functions ---
+
+def _classified_status(soup: BeautifulSoup) -> int | None:
+    """The HTTP status the page state reports for the classified, if any."""
+    tag = soup.find("script", string=lambda text: text is not None and "__UFRN_LIFECYCLE_SERVERREQUEST__" in text)  # type: ignore
+    if tag is None:
+        return None
+    try:
+        raw = str(tag).split('JSON.parse("')[1].split('");</script>')[0].strip()
+        state = json.loads(raw.replace(r"\\", "\\").replace(r"\"", '"'))
+    except (IndexError, ValueError):
+        return None
+    page = state.get(JSON_KEY) or state.get(JSON_KEY_RENAMED) or {}
+    status = ((page.get("data") or {}).get("classified") or {}).get("statusCode")
+    return status if isinstance(status, int) else None
+
+
+def _gallery(json_data: dict[str, Any]) -> dict[str, Any]:
+    """Images and floorplans: `sections.gallery` until 2026-09-23, `domains.medias` since."""
+    classified = json_data.get(JSON_KEY, {}).get("data", {}).get("classified", {})
+    return classified.get("sections", {}).get("gallery") or classified.get("domains", {}).get("medias") or {}
+
 
 def _get_main_image_from_open_graphs(open_graphs: list[dict[str, Any]]) -> str | None:
     for og in open_graphs:
