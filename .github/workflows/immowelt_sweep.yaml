@@ -78,7 +78,9 @@ jobs:
         if: ${{ inputs.use_proxy }}
         uses: tailscale/github-action@v3
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
           hostname: gha-immowelt-sweep
 
       - name: Create config.json
