@@ -8,8 +8,6 @@
 seleniumbase==4.51.12
 sbvirtualdisplay==1.4.0
 pyvirtualdisplay==3.0
-google-cloud-compute==1.50.0
-google-auth==2.56.3
 requests==2.34.2
 beautifulsoup4==4.15.0
 lxml==6.1.1

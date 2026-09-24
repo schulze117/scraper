@@ -1,10 +1,7 @@
-import atexit
-
 from lib.fetch._curl_cffi import get_html_curlcffi
 from lib.fetch._seleniumbase import get_html_seleniumbase
-from lib.proxy import FirewallManager
 
-from lib.config import get_config, env_bool
+from lib.config import get_config
 from lib.exceptions import BotDetectedError
 from lib.helpers import expand_proxy_url, has_bot_detection, redact_proxy
 from lib.logger import get_logger
@@ -20,22 +17,7 @@ class Fetcher:
         """
         self.method = method
         self.proxy_url = proxy_url
-        
-        # --- FIREWALL INTEGRATION ---
-        # Only for the self-hosted GCP proxy, which allow-lists the caller's IP.
-        # Third-party proxies (e.g. DataImpulse) need none of this, and running
-        # it without GCP credentials present just throws — hence opt-in.
-        self._fw_manager = None
-        if self.proxy_url and env_bool("PROXY_MANAGE_FIREWALL", False):
-            try:
-                logger.info("Proxy detected. initializing firewall...")
-                self._fw_manager = FirewallManager()
-                self._fw_manager.authorize_current_ip()
-            except Exception as e:
-                logger.warning(f"Could not update firewall rules: {e}")
-                # We don't raise here, in case the rule already exists
-                # or we want to try fetching anyway.
-        elif self.proxy_url:
+        if self.proxy_url:
             logger.info(f"Using proxy {redact_proxy(self.proxy_url)}")
 
     def fetch(self, url: str, ready_marker: str | None = None) -> str:

@@ -3,8 +3,8 @@ name: Test IP Sweep
 # Diagnostic: fetch the same URL from 20 runners in parallel (20 different
 # GitHub Actions IPs at once) to see whether ANY datacenter IP slips past the
 # WAF with the current stealth setup. Each job prints its public IP + result.
-# This is what the finder's exit-42 retry loop does sequentially, compressed
-# into one dispatch. Aggregate the "SWEEP_RESULT" lines from the run logs.
+# This is what the immowelt scraper's exit-42 retry loop does sequentially,
+# compressed into one dispatch. Aggregate the "SWEEP_RESULT" lines from the run logs.
 
 on:
   workflow_dispatch:

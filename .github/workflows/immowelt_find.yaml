@@ -4,15 +4,9 @@ name: Run Immowelt Finder
 # ../ecosystem.md. The cadence lives in /etc/cron.d/fixfolio.
 on:
   workflow_dispatch:
-    inputs:
-      retry_count:
-        description: 'Bot detection retry attempt'
-        required: false
-        default: '0'
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
   run-script:
@@ -45,45 +39,10 @@ jobs:
           echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
-          echo "PROXY_URL__IMMOWELT=${{ secrets.PROXY_URL__IMMOWELT }}" >> .env
 
-      - name: Create Service Account JSON
-        run: echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > immofinder-438008-411bf1440a6c.json
-
+      # No retry-on-42 step, unlike immowelt_scrape.yaml. The finder never exits
+      # 42: a blocked page is a failed page, and a lost page 1 ends the run red
+      # with 1 (FinderFailedError). The step that used to sit here re-dispatched
+      # on an exit code nothing could produce.
       - name: Run Immowelt Finder
-        id: run
-        continue-on-error: true
-        run: |
-          set +e
-          python -m find.immowelt
-          EXIT_CODE=$?
-          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          exit $EXIT_CODE
-
-      - name: Retry on bot detection
-        if: steps.run.outputs.exit_code == '42'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          RETRY="${{ inputs.retry_count }}"
-          RETRY=${RETRY:-0}
-          MAX=15
-          if [ "$RETRY" -lt "$MAX" ]; then
-            echo "Bot detected (attempt $((RETRY+1))/$MAX). Dispatching retry with new IP..."
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/immowelt_find.yaml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"retry_count\":\"$((RETRY+1))\"}}")
-            echo "API response: $STATUS"
-            [ "$STATUS" = "204" ] || exit 1
-          else
-            echo "Max retries ($MAX) reached."
-            exit 1
-          fi
-
-      - name: Fail on non-bot errors
-        if: steps.run.outcome == 'failure' && steps.run.outputs.exit_code != '42'
-        run: exit 1
+        run: python -m find.immowelt

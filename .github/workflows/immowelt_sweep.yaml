@@ -29,14 +29,9 @@ on:
         required: false
         default: true
         type: boolean
-      retry_count:
-        description: 'Bot detection retry attempt'
-        required: false
-        default: '0'
 
 permissions:
   contents: read
-  actions: write
 
 # Own group — see immoscout_sweep.yaml.
 concurrency:
@@ -96,52 +91,10 @@ jobs:
           echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
-          # PROXY_URL only. `resolve_proxy` prefers PROXY_URL__IMMOWELT, and
-          # that secret still holds the metered DataImpulse endpoint -- writing
-          # it here would silently send this run somewhere other than the AI
-          # server, which is the whole thing being tested.
           echo "PROXY_URL=${{ secrets.PROXY_URL }}" >> .env
 
-      - name: Create Service Account JSON
-        run: echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > immofinder-438008-411bf1440a6c.json
-
+      # No retry-on-42 step. The finder never exits 42 -- a blocked page is a
+      # failed page and costs the sweep its `complete` -- and through the proxy
+      # a fresh runner would not bring a fresh exit IP anyway.
       - name: Sweep ${{ inputs.category }}
-        id: run
-        continue-on-error: true
-        run: |
-          set +e
-          python -m find.immowelt --sweep --category "${{ inputs.category }}"
-          EXIT_CODE=$?
-          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
-          exit $EXIT_CODE
-
-      # The retry has to carry the category forward. Without it a blocked sweep
-      # would come back as an all-category run, which is the thing this workflow
-      # is split up to avoid.
-      - name: Retry on bot detection
-        if: steps.run.outputs.exit_code == '42'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          RETRY="${{ inputs.retry_count }}"
-          RETRY=${RETRY:-0}
-          MAX=5
-          if [ "$RETRY" -lt "$MAX" ]; then
-            echo "Bot detected (attempt $((RETRY+1))/$MAX). Dispatching retry with new IP..."
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/immowelt_sweep.yaml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"retry_count\":\"$((RETRY+1))\",\"category\":\"${{ inputs.category }}\",\"use_proxy\":${{ inputs.use_proxy }}}}")
-            echo "API response: $STATUS"
-            [ "$STATUS" = "204" ] || exit 1
-          else
-            echo "Max retries ($MAX) reached."
-            exit 1
-          fi
-
-      - name: Fail on non-bot errors
-        if: steps.run.outcome == 'failure' && steps.run.outputs.exit_code != '42'
-        run: exit 1
+        run: python -m find.immowelt --sweep --category "${{ inputs.category }}"

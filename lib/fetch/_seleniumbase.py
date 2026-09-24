@@ -222,8 +222,8 @@ def get_html_seleniumbase(
     on a fresh runner IP. `screenshot_path`, when given, saves a PNG of the final
     page — used by the lib.fetch.fetch_url test harness (no overhead in production).
 
-    `on_block` decides what a persistent block does, and the three callers want
-    three different things:
+    `on_block` decides what a persistent block does, and the two callers want
+    two different things:
 
       "exit"   os._exit(42) -- the fetch_url harness, where the run IS the probe.
       "raise"  BotDetectedError -- the pipeline. A block must not kill the run
@@ -232,8 +232,6 @@ def get_html_seleniumbase(
                the scrapers read it as a deleted listing and deactivate 19 live
                ones on 2026-09-17. Raising makes that confusion impossible, and
                the caller counts the blocks and decides when to give up.
-      "return" the blocked HTML verbatim -- the GCP-proxy probe, whose whole job
-               is to look at it and judge the IP.
 
     The actual work runs on a daemon thread with a hard wall-clock cap. A CDP call
     (get_page_source/reload) can block forever when the proxied connection stalls
@@ -338,12 +336,6 @@ def _fetch_body(
                     # os._exit below kills the process before the caller can
                     # write anything, so persist the block-page HTML here too.
                     _save_html(html, os.path.splitext(screenshot_path)[0] + ".html")
-                if on_block == "return":
-                    logger.warning(
-                        f"Bot detection persists for {url} after {BOT_SOLVE_ATTEMPTS} "
-                        f"attempts (len {len(html)}); returning blocked HTML (probe mode)."
-                    )
-                    return html
                 if on_block == "raise":
                     logger.warning(
                         f"Bot detection persists for {url} after {BOT_SOLVE_ATTEMPTS} "

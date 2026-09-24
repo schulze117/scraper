@@ -36,10 +36,6 @@ jobs:
           echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
-          echo "PROXY_URL__KLEINANZEIGEN=${{ secrets.PROXY_URL__KLEINANZEIGEN }}" >> .env
-
-      - name: Create Service Account JSON
-        run: echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > immofinder-438008-411bf1440a6c.json
 
       - name: Run Kleinanzeigen Finder
         run: python -m find.kleinanzeigen
