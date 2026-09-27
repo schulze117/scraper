@@ -23,7 +23,7 @@ logger = get_logger("_seleniumbase")
 _LOG_LEVEL_INT = getattr(logging, str(getattr(config, "log_level", "INFO")).upper(), logging.INFO)
 
 # On a bot-detection / captcha page, how many solve+reload cycles to try before
-# giving up on this IP (then the workflow re-dispatches on a fresh runner IP).
+# giving up on this IP (then the run ends with exit 42).
 BOT_SOLVE_ATTEMPTS = 3
 
 # --- Hard-case stealth defaults (mdmintz's advice for the toughest anti-bot) ---
@@ -218,8 +218,8 @@ def get_html_seleniumbase(
     """Fetch a page with Pure CDP Mode (undetected Chromium) and return its HTML.
 
     On a suspected bot/captcha page it waits + reloads (and best-effort solves)
-    up to BOT_SOLVE_ATTEMPTS times, then os._exit(42) so the workflow re-dispatches
-    on a fresh runner IP. `screenshot_path`, when given, saves a PNG of the final
+    up to BOT_SOLVE_ATTEMPTS times, then os._exit(42), which ends the run red.
+    `screenshot_path`, when given, saves a PNG of the final
     page — used by the lib.fetch.fetch_url test harness (no overhead in production).
 
     `on_block` decides what a persistent block does, and the two callers want

@@ -49,8 +49,9 @@ class BaseScraper(ABC):
     # `0` means unlimited, which is what a local drain wants.
     TIME_BUDGET_MIN = 270
 
-    # Consecutive blocked fetches that end the run with exit 42, which the
-    # workflow answers by re-dispatching onto a fresh runner IP (up to 15 times).
+    # Consecutive blocked fetches that end the run with exit 42. The run ends
+    # red; the next scheduled slot starts on a fresh runner IP. 42 rather than 1
+    # only so the log tells a wall apart from a broken page.
     #
     # The number has to separate two things that look identical for one listing:
     # a portal having a bad moment with us, and the portal having decided about
@@ -59,8 +60,8 @@ class BaseScraper(ABC):
     # after it is wasted: on 2026-09-17 immowelt blocked 19 in a row over 40
     # minutes and the run would have kept going for another four hours.
     #
-    # Deliberately low. The cost of stopping early is one re-dispatch; the cost
-    # of continuing is a queue drained against a wall.
+    # Deliberately low. Every fetch after the wall is wasted, and the listings
+    # stay queued for the next slot either way.
     BOT_BLOCKS_TO_ABORT = 4
 
     # Consecutive listings the browser could not reach at all (FetchNetworkError:
@@ -78,6 +79,15 @@ class BaseScraper(ABC):
     # the longest streak is 0 (kleinanzeigen, 4 851 listings, 2026-09-24).
     PARSE_FAILURES_TO_ABORT = 10
 
+    # Consecutive listings saved without a single photo, ending the run with
+    # exit 1. On one page an ad without photos and an image list the parser no
+    # longer finds look the same; over a streak they do not. Text-only ads come
+    # in blocks (ten prefab-house ads from one advertiser, immowelt 2026-09-26),
+    # but the longest natural streak over 30 days was 9 on kleinanzeigen, 5 on
+    # immowelt and 2 on immoscout (2026-09-27). Counted after the save, so the
+    # listings are kept and the next run moves past them.
+    NO_IMAGE_STREAK_TO_ABORT = 20
+
     def __init__(self, source: ListingSource, method: str, proxy_url: str | None):
         self.source = source
         self.config = get_config()
@@ -91,6 +101,7 @@ class BaseScraper(ABC):
         self._consecutive_blocks = 0
         self._consecutive_unreachable = 0
         self._consecutive_parse_failures = 0
+        self._consecutive_no_images = 0
         self._block_lock = threading.Lock()
 
     def _time_budget_s(self) -> float:
@@ -207,8 +218,9 @@ class BaseScraper(ABC):
                 self.db.update_extra_data(listing.id, extra_data)
             self.db.set_last_scraped(listing.id)
 
-            self.logger.info(f"{prefix}  Scraped successfully")
+            self.logger.info(f"{prefix}  Scraped successfully{'' if image_urls else ' (no photos)'}")
             self._note_parsed()
+            self._note_images(found=bool(image_urls))
 
         except BotDetectedError as e:
             # Never a deactivation: we did not see the page, so we know nothing
@@ -255,8 +267,7 @@ class BaseScraper(ABC):
 
         os._exit rather than an exception: this can run inside a worker thread,
         where raising only kills that future and leaves the rest of the batch
-        fetching into the same wall. 42 is the code the workflow watches for --
-        it re-dispatches on a fresh IP instead of reporting a failure.
+        fetching into the same wall.
         """
         with self._block_lock:
             self._consecutive_blocks += 1
@@ -265,8 +276,8 @@ class BaseScraper(ABC):
             self.logger.warning(f"Blocked fetch {n}/{self.BOT_BLOCKS_TO_ABORT} in a row.")
             return
         self.logger.error(
-            f"{n} blocked fetches in a row — this IP is walled. Stopping with exit 42 "
-            f"so the workflow retries on a fresh runner. Unscraped listings stay queued."
+            f"{n} blocked fetches in a row — this IP is walled. Stopping with exit 42; "
+            f"the next scheduled run starts on a fresh runner. Unscraped listings stay queued."
         )
         os._exit(42)
 
@@ -288,6 +299,22 @@ class BaseScraper(ABC):
         self.logger.error(
             f"{n} listings in a row failed to parse — the portal has likely changed "
             f"its page. Stopping with exit 1. Unscraped listings stay queued."
+        )
+        os._exit(1)
+
+    def _note_images(self, found: bool) -> None:
+        """Count listings saved without photos; end the run on a streak.
+
+        os._exit for the same reason as `_note_block`.
+        """
+        with self._block_lock:
+            self._consecutive_no_images = 0 if found else self._consecutive_no_images + 1
+            n = self._consecutive_no_images
+        if n < self.NO_IMAGE_STREAK_TO_ABORT:
+            return
+        self.logger.error(
+            f"{n} listings in a row had no photos — the portal has likely moved its "
+            f"image list. Stopping with exit 1."
         )
         os._exit(1)
 

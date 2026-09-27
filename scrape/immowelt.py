@@ -4,7 +4,13 @@ from typing import Any
 from bs4 import BeautifulSoup, Tag
 
 from lib.config import get_config, resolve_proxy
-from lib.exceptions import ElementNotFoundError, GoneError, InactiveListingError, NotBeautifulSoupError
+from lib.exceptions import (
+    ElementNotFoundError,
+    GoneError,
+    InactiveListingError,
+    NotBeautifulSoupError,
+    StructureChangedError,
+)
 from lib.models import ListingSource, NextListingModel
 from .base import BaseScraper
 
@@ -97,21 +103,24 @@ class ImmoweltScraper(BaseScraper):
 
     def get_image_urls(self, soup: BeautifulSoup, json_data: dict[str, Any]) -> list[str]:
         gallery = _gallery(json_data)
-
-        if not gallery:
-            self.logger.warning("No gallery section found in JSON data")
-            return []
-
         images: list[dict[str, Any]] = gallery.get("images", []) + gallery.get("floorplans", [])
-        if not images:
-            raise ElementNotFoundError("No images or floorplans found in gallery section")
+        image_urls = [image["url"] for image in images if "url" in image]
+        if image_urls:
+            return image_urls
 
-        return [image["url"] for image in images if "url" in image]
+        # Text-only ads have no photos, but a gallery that moved looks the same.
+        # The preview image sits elsewhere on the page and is empty exactly when
+        # the ad has none, so only a preview entry that is present and empty
+        # counts as proof. The base scraper still stops on a streak of these.
+        preview = _get_main_image_from_open_graphs(_head_info(json_data).get("openGraphs") or [])
+        if preview is None:
+            raise StructureChangedError("gallery", "no photos found and no og:image entry to confirm it")
+        if preview:
+            raise StructureChangedError("gallery", f"no photos found, but og:image has {preview}")
+        return []
 
     def get_main_image_url(self, soup: BeautifulSoup, json_data: dict[str, Any]) -> str | None:
-        head_info: dict[str, Any] = (
-            json_data.get("app_cldp", {}).get("data", {}).get("classified", {}).get("seo", {}).get("headInfo", {})
-        )
+        head_info = _head_info(json_data)
 
         if head_info:
             if "openGraphs" in head_info and isinstance(head_info["openGraphs"], list):
@@ -167,6 +176,10 @@ def _gallery(json_data: dict[str, Any]) -> dict[str, Any]:
     """Images and floorplans: `sections.gallery` until 2026-09-23, `domains.medias` since."""
     classified = json_data.get(JSON_KEY, {}).get("data", {}).get("classified", {})
     return classified.get("sections", {}).get("gallery") or classified.get("domains", {}).get("medias") or {}
+
+
+def _head_info(json_data: dict[str, Any]) -> dict[str, Any]:
+    return json_data.get(JSON_KEY, {}).get("data", {}).get("classified", {}).get("seo", {}).get("headInfo", {})
 
 
 def _get_main_image_from_open_graphs(open_graphs: list[dict[str, Any]]) -> str | None:
