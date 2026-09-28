@@ -50,8 +50,8 @@ class BaseScraper(ABC):
     TIME_BUDGET_MIN = 270
 
     # Consecutive blocked fetches that end the run with exit 42. The run ends
-    # red; the next scheduled slot starts on a fresh runner IP. 42 rather than 1
-    # only so the log tells a wall apart from a broken page.
+    # red and the next scheduled slot tries again. 42 rather than 1 only so the
+    # log tells a wall apart from a broken page.
     #
     # The number has to separate two things that look identical for one listing:
     # a portal having a bad moment with us, and the portal having decided about
@@ -277,7 +277,7 @@ class BaseScraper(ABC):
             return
         self.logger.error(
             f"{n} blocked fetches in a row — this IP is walled. Stopping with exit 42; "
-            f"the next scheduled run starts on a fresh runner. Unscraped listings stay queued."
+            f"the next scheduled run tries again. Unscraped listings stay queued."
         )
         os._exit(42)
 

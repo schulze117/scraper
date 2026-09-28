@@ -9,6 +9,11 @@ on:
         description: 'Minutes of scraping before the run stops itself (0 = unlimited)'
         required: false
         default: '300'
+      use_proxy:
+        description: 'Route through the AI-server residential proxy over Tailscale'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -31,8 +36,13 @@ jobs:
     # until 2026-09-14, so every run died at 4 h as `cancelled`.
     timeout-minutes: 325
 
+    # Proxied by default. Direct from a GitHub runner DataDome walled every run
+    # after ~190 exposés (four runs, 2026-09-27/28); the residential exit is what
+    # already carries the immowelt sweep. The proxy is shared -- the crontab keeps
+    # this scrape's 03:10 slot clear of the 06:00 immowelt sweep.
     env:
       SCRAPE_TIME_BUDGET_MIN: ${{ inputs.time_budget_min }}
+      USE_PROXY: ${{ inputs.use_proxy }}
 
     steps:
       - name: Checkout code
@@ -48,6 +58,15 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      - name: Connect to Tailscale
+        if: ${{ inputs.use_proxy }}
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gha-immowelt-scrape
+
       - name: Create config.json
         env:
           CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
@@ -61,10 +80,10 @@ jobs:
           echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
+          echo "PROXY_URL=${{ secrets.PROXY_URL }}" >> .env
 
-      # A walled IP (exit 42) ends the run red, like any other failure, and the
-      # next slot starts on a fresh runner with a fresh IP. No re-dispatch: the
-      # cadence is the crontab's four slots a day, and a chain of up to 15
-      # retries turned one blocked slot into dozens of runs.
+      # A walled IP (exit 42) ends the run red, like any other failure. No
+      # re-dispatch: the cadence is the crontab's four slots a day, and through
+      # the proxy a fresh runner would not bring a fresh exit IP anyway.
       - name: Run Immowelt Scraper
         run: python -m scrape.immowelt
