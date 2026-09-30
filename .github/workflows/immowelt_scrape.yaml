@@ -32,7 +32,8 @@ jobs:
     timeout-minutes: 325
 
     # Direct, never through the residential proxy. DataDome walls a runner IP
-    # after ~190 exposés, so the scraper stops itself at 150
+    # after ~30 exposés, or ~190 on about one runner in three, so the scraper
+    # stops itself at 150
     # (ImmoweltScraper.MAX_LISTINGS_PER_RUN) and the next slot brings a fresh
     # runner. Through the proxy it was worse: a challenge on every page after ~44
     # and hard blocks from the second day (2026-09-28/29).
