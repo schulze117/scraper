@@ -49,6 +49,12 @@ class BaseScraper(ABC):
     # `0` means unlimited, which is what a local drain wants.
     TIME_BUDGET_MIN = 270
 
+    # Listings one run may fetch before it stops itself, green; None for no cap.
+    # For a portal whose wall is a count per IP rather than a rate: stopping
+    # below it ends the run cleanly and leaves the rest to the next slot's fresh
+    # runner, where running into it ends red with 42 and burns the IP.
+    MAX_LISTINGS_PER_RUN: int | None = None
+
     # Consecutive blocked fetches that end the run with exit 42. The run ends
     # red and the next scheduled slot tries again. 42 rather than 1 only so the
     # log tells a wall apart from a broken page.
@@ -127,24 +133,33 @@ class BaseScraper(ABC):
         Main strategy:
         1. Fetch a batch of unscraped listings from the DB
         2. Process each listing (Concurrently OR Sequentially based on flag)
-        3. Repeat until the queue is empty, the time budget is spent, or Ctrl+C
+        3. Repeat until the queue is empty, the time budget or the listing cap
+           is spent, or Ctrl+C
         """
         scrape_config = getattr(self.config.scrape, self.source.value)
         batch_size = scrape_config.batch_size
         total_scraped = 0
         budget_s = self._time_budget_s()
+        cap = self.MAX_LISTINGS_PER_RUN
         started = time.monotonic()
 
         def over_budget() -> bool:
             return bool(budget_s) and (time.monotonic() - started) >= budget_s
 
+        def over_cap() -> bool:
+            return bool(cap) and total_scraped >= cap
+
         try:
             while True:
-                if over_budget():
+                if over_budget() or over_cap():
                     break
 
+                # Claim no more than the cap leaves: a claimed listing that is
+                # never processed sits out its claim before anyone may take it.
                 listings = self.db.get_next_listings(
-                    self.source, batch_size, rescrape_on_modified_only=self.RESCRAPE_ON_MODIFIED_ONLY
+                    self.source,
+                    min(batch_size, cap - total_scraped) if cap else batch_size,
+                    rescrape_on_modified_only=self.RESCRAPE_ON_MODIFIED_ONLY,
                 )
 
                 if not listings:
@@ -177,13 +192,20 @@ class BaseScraper(ABC):
                     for listing in listings:
                         self.process_listing(listing)
                         total_scraped += 1
-                        if over_budget():
+                        if over_budget() or over_cap():
                             break
 
         except KeyboardInterrupt:
             self.logger.info(f"Interrupted. Total processed: {total_scraped}")
             return
 
+        if over_cap():
+            self.logger.info(
+                f"Cap of {cap} listings per run reached after "
+                f"{(time.monotonic() - started) / 60:.0f} min. Stopping cleanly; the rest "
+                f"stays queued for the next run."
+            )
+            return
         self.logger.info(
             f"Time budget of {budget_s / 60:.0f} min spent after "
             f"{(time.monotonic() - started) / 60:.0f} min. Stopping cleanly; the rest "

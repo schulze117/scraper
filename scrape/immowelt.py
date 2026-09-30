@@ -30,6 +30,11 @@ class ImmoweltScraper(BaseScraper):
     CONCURRENT_LISTINGS = False
     # Only re-scrape when the listing has been modified since last scrape
     RESCRAPE_ON_MODIFIED_ONLY = True
+    # Direct from a runner DataDome walls a run after ~190 exposés (four runs,
+    # 2026-09-27/28); 150 stays under that, and the next slot brings a fresh
+    # runner IP. The residential proxy was worse: a challenge on every page
+    # after ~44, and hard blocks from the second day (2026-09-28/29).
+    MAX_LISTINGS_PER_RUN = 150
 
     def __init__(self):
         method = config.scrape.immowelt.method

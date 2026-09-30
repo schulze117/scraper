@@ -7,9 +7,9 @@ from bs4 import BeautifulSoup
 from lib.logger import get_logger
 from lib.fetch.fetcher import Fetcher
 from lib.database import Database
-from lib.config import get_config
+from lib.config import get_config, proxy_url_for
 from lib.models import ListingSource
-from lib.exceptions import FinderFailedError, ResultTailReachedError
+from lib.exceptions import BotDetectedError, FinderFailedError, ResultTailReachedError
 
 
 class BaseFinder(ABC):
@@ -56,6 +56,15 @@ class BaseFinder(ABC):
     # yields the page count, so losing it discards every page behind it. One
     # blocked fetch must not cost a category, so it gets its own retries.
     PAGE_ONE_ATTEMPTS: int = 3
+    # A sweep that starts direct moves to the residential proxy at its first
+    # block, retries that page there and stays there for the rest of the run. A
+    # streak of SWEEP_FAILURES_TO_ABORT failed pages, and the retry of failed
+    # pages at the end, move it there too.
+    # The sweep is the one run that has to reach the last page -- a single page
+    # it cannot read costs the source its reconcile -- and a runner IP that has
+    # been walled does not come back within the run. Sweep mode only; the
+    # incremental finder stays on whatever it started with.
+    PROXY_FALLBACK_IN_SWEEP: bool = False
 
     def __init__(self, method: str, proxy_url: str | None):
         self.config = get_config()
@@ -86,6 +95,7 @@ class BaseFinder(ABC):
         # safe either way; the counts are not, and they end up in the record.
         self._tally_lock = threading.Lock()
         self.db = Database()
+        self.method = method
         self.fetcher = Fetcher(method=method, proxy_url=proxy_url)
         # get worker based on method and config 
         # get max_workers based on method and config
@@ -212,6 +222,9 @@ class BaseFinder(ABC):
         with self._tally_lock:
             self._pages_failed -= len(pending)
 
+        # A sweep that never met a block can still have lost pages direct; their
+        # second try goes through the proxy too, where deep pages are safest.
+        self._fall_back_to_proxy(f"{len(pending)} failed page(s) to retry")
         self.logger.info(f"Retrying {len(pending)} failed page(s) before scoring the run.")
         recovered = 0
         for category, location, page in pending:
@@ -350,6 +363,14 @@ class BaseFinder(ABC):
                     # grinding through the remaining hundred proves nothing and
                     # just burns runner minutes against a wall.
                     consecutive_failures += 1
+                    # A streak that was never read as a block -- timeouts, pages
+                    # that load but do not parse -- gets the proxy too before it
+                    # may end the sweep. The pages it cost are retried at the end.
+                    if (consecutive_failures >= self.SWEEP_FAILURES_TO_ABORT
+                            and self._fall_back_to_proxy(
+                                f"{consecutive_failures} failed pages in a row at page {page}")):
+                        consecutive_failures = 0
+                        continue
                     if consecutive_failures >= self.SWEEP_FAILURES_TO_ABORT:
                         self.logger.error(
                             f"Sweep aborted at page {page} of {last_page} for {location}: "
@@ -451,15 +472,52 @@ class BaseFinder(ABC):
             self.logger.info(f"Tail page {page} for {location}: {e}")
             return 0, None, True
 
+        except BotDetectedError as e:
+            # The blocked attempt is not counted: the page gets a clean second
+            # try through the proxy. The switch happens once, so this recursion
+            # is at most one level deep.
+            if self._fall_back_to_proxy(f"Blocked on page {page} (URL: {url})"):
+                return self.process_page_strategy(category, location, page)
+            return self._fail_page(category, location, page, url, e)
+
         except Exception as e:
-            self.logger.error(f"Failed page {page} for {location} (URL: {url}): {e}")
-            # One failed page disqualifies the whole sweep. A page we could not
-            # read is a page whose listings we cannot claim to have seen, and
-            # reconcile.py would otherwise deactivate every one of them.
-            with self._tally_lock:
-                self._pages_failed += 1
-                self._failed_pages.append((category, location, page))
-            return 0, None, False
+            return self._fail_page(category, location, page, url, e)
+
+    def _fail_page(self, category, location, page, url, error) -> tuple[int, None, bool]:
+        self.logger.error(f"Failed page {page} for {location} (URL: {url}): {error}")
+        # One failed page disqualifies the whole sweep. A page we could not
+        # read is a page whose listings we cannot claim to have seen, and
+        # reconcile.py would otherwise deactivate every one of them.
+        with self._tally_lock:
+            self._pages_failed += 1
+            self._failed_pages.append((category, location, page))
+        return 0, None, False
+
+    def _fall_back_to_proxy(self, reason: str) -> bool:
+        """Swap the fetcher for one through the residential proxy, once per run.
+
+        True when the swap happened and the page should be fetched again. False
+        when there is nothing to fall back to: not a sweep, a portal without the
+        flag, already on a proxy, or no PROXY_URL on this runner.
+        """
+        if not (self.sweep and self.PROXY_FALLBACK_IN_SWEEP):
+            return False
+        with self._tally_lock:
+            if self.fetcher.proxy_url:
+                return False
+            proxy_url = proxy_url_for(self.SOURCE.value)
+            if not proxy_url:
+                self.logger.error(
+                    f"{reason}, but no PROXY_URL is set — the sweep stays direct "
+                    f"and will likely not complete.")
+                return False
+            direct_pages = self._pages_ok
+            self.fetcher = Fetcher(method=self.method, proxy_url=proxy_url)
+            self._sweep_detail.append(f"proxy after {direct_pages} direct pages")
+        self.logger.warning(
+            f"{reason} after {direct_pages} direct pages. Moving the rest of the "
+            f"sweep onto the residential proxy.")
+        return True
 
     # --- Abstract Methods ---
 

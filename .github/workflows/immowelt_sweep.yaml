@@ -9,10 +9,11 @@ name: Run Immowelt Sweep
 # is 172 of the 378.
 #
 # Depth is the whole point here and also the whole risk: from a GitHub runner IP
-# DataDome walls the sweep around page 45, which is why the incremental finder
-# caps at MAX_PAGES=20 and why this workflow never completed a category. The
-# residential exit removes that wall entirely — 174/174 pages, zero blocks, on
-# run 34883536366 (2026-09-14) — so use_proxy defaults to true here.
+# DataDome walls the sweep around page 40-50 of a category. The residential exit
+# does not hit that wall -- 174/174 pages, zero blocks, on run 34883536366
+# (2026-09-14) -- so the sweep starts direct and moves onto the proxy at its first
+# block (ImmoweltFinder.PROXY_FALLBACK_IN_SWEEP), retrying that page there. The
+# sweep_run row says where: `proxy after N direct pages`.
 #
 # A sweep that does get blocked deep costs the pages behind the block and nothing
 # else: it records complete=false and reconcile.py then does nothing for the
@@ -25,9 +26,9 @@ on:
         required: true
         type: string
       use_proxy:
-        description: 'Route through the AI-server residential proxy over Tailscale'
+        description: 'Start on the AI-server residential proxy instead of falling back to it at the first block'
         required: false
-        default: true
+        default: false
         type: boolean
 
 permissions:
@@ -43,15 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
-    # On by default since 2026-09-16. Direct from a GitHub runner this sweep
-    # aborted at page 48-49 of 172 every time and recorded complete=false, which
-    # is what kept immowelt out of reconcile.py; through the residential exit the
-    # same category walked all 174 pages with zero blocks.
-    #
-    # The proxy is a shared resource: the same AI server carries immoscout find
-    # and scrape and the immoscout sweep, and the crontab keeps all of them apart
-    # on purpose -- this one has the 06:00 slot. Check what else holds it before
-    # dispatching an off-schedule run -- ../ecosystem.md#schedules.
+    # Tailscale and PROXY_URL are always set up, because the fallback needs them
+    # mid-run. The proxy is a shared resource: the same AI server carries immoscout
+    # find, scrape and sweep, and the crontab keeps them apart -- this sweep has the
+    # 06:00 slot. Check what else holds it before dispatching an off-schedule run --
+    # ../architektur.md#takt.
     env:
       USE_PROXY: ${{ inputs.use_proxy }}
 
@@ -70,7 +67,6 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Connect to Tailscale
-        if: ${{ inputs.use_proxy }}
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -93,8 +89,8 @@ jobs:
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
           echo "PROXY_URL=${{ secrets.PROXY_URL }}" >> .env
 
-      # No retry-on-42 step. The finder never exits 42 -- a blocked page is a
-      # failed page and costs the sweep its `complete` -- and through the proxy
-      # a fresh runner would not bring a fresh exit IP anyway.
+      # No retry-on-42 step. The finder never exits 42: a block moves the sweep
+      # onto the proxy, and a page that fails there too is a failed page and
+      # costs the sweep its `complete`.
       - name: Sweep ${{ inputs.category }}
         run: python -m find.immowelt --sweep --category "${{ inputs.category }}"

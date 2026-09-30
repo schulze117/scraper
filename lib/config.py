@@ -73,7 +73,7 @@ def resolve_proxy(stage: str, source: str) -> str | None:
     if not enabled:
         return None
 
-    proxy_url = env_get(f"PROXY_URL__{source.upper()}") or env_get("PROXY_URL")
+    proxy_url = proxy_url_for(source)
     if not proxy_url:
         # Deliberately not fatal: a missing proxy secret shouldn't stop a run
         # that would otherwise work directly.
@@ -88,6 +88,13 @@ def resolve_proxy(stage: str, source: str) -> str | None:
     # Returned with any sticky port range intact — Fetcher expands it per fetch,
     # so each page gets its own session rather than the whole run sharing one IP.
     return proxy_url
+
+
+def proxy_url_for(source: str) -> str | None:
+    """The proxy URL for `source` whether or not the proxy is switched on:
+    `PROXY_URL__<SOURCE>`, then the shared `PROXY_URL`. resolve_proxy asks this
+    once the switch says yes; the sweep's fallback asks it after a block."""
+    return env_get(f"PROXY_URL__{source.upper()}") or env_get("PROXY_URL")
 
 
 # Example usage if the file is called directly
