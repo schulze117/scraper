@@ -70,6 +70,13 @@ class BaseScraper(ABC):
     # stay queued for the next slot either way.
     BOT_BLOCKS_TO_ABORT = 4
 
+    # When True, that wall ends the run green (exit 0) once the portal has
+    # answered at least one fetch this run: the wall is then the per-IP limit
+    # doing what it always does, not news. A wall before any answer stays 42.
+    # For a portal whose wall is routine -- immowelt stops two runners in three
+    # at ~30 exposés -- red would otherwise be the normal colour of a run.
+    WALL_AFTER_FETCHES_ENDS_GREEN = False
+
     # Consecutive listings the browser could not reach at all (FetchNetworkError:
     # a dead proxy tunnel, DNS, no route) that end the run with exit 1. Not 42:
     # a new runner does not bring a proxy back. Each one has already been retried
@@ -106,6 +113,7 @@ class BaseScraper(ABC):
         # threads when CONCURRENT_LISTINGS is on, so it takes the lock.
         self._consecutive_blocks = 0
         self._consecutive_unreachable = 0
+        self._fetches_ok = 0
         self._consecutive_parse_failures = 0
         self._consecutive_no_images = 0
         self._block_lock = threading.Lock()
@@ -283,6 +291,7 @@ class BaseScraper(ABC):
         with self._block_lock:
             self._consecutive_blocks = 0
             self._consecutive_unreachable = 0
+            self._fetches_ok += 1
 
     def _note_block(self) -> None:
         """Count a block and end the run once they stop looking like noise.
@@ -294,9 +303,17 @@ class BaseScraper(ABC):
         with self._block_lock:
             self._consecutive_blocks += 1
             n = self._consecutive_blocks
+            fetched = self._fetches_ok
         if n < self.BOT_BLOCKS_TO_ABORT:
             self.logger.warning(f"Blocked fetch {n}/{self.BOT_BLOCKS_TO_ABORT} in a row.")
             return
+        if self.WALL_AFTER_FETCHES_ENDS_GREEN and fetched:
+            self.logger.info(
+                f"{n} blocked fetches in a row after {fetched} answered ones — this "
+                f"IP has reached the portal's limit. Stopping cleanly; the rest stays "
+                f"queued for the next run."
+            )
+            os._exit(0)
         self.logger.error(
             f"{n} blocked fetches in a row — this IP is walled. Stopping with exit 42; "
             f"the next scheduled run tries again. Unscraped listings stay queued."

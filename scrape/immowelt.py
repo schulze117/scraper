@@ -32,9 +32,12 @@ class ImmoweltScraper(BaseScraper):
     RESCRAPE_ON_MODIFIED_ONLY = True
     # Direct from a runner DataDome walls a run after ~30 exposés or, on about
     # one runner in three, ~190 (21 runs, 2026-09-25 to 09-30); 150 stays under
-    # the higher step, and the next slot brings a fresh runner IP. The residential proxy was worse: a challenge on every page
-    # after ~44, and hard blocks from the second day (2026-09-28/29).
+    # the higher step, and the next slot, two hours on, brings a fresh runner IP.
+    # The residential proxy was worse: a challenge on every page after ~44, and
+    # hard blocks from the second day (2026-09-28/29).
     MAX_LISTINGS_PER_RUN = 150
+    # So the ~30 wall is the ordinary end of most runs, and it ends them green.
+    WALL_AFTER_FETCHES_ENDS_GREEN = True
 
     def __init__(self):
         method = config.scrape.immowelt.method

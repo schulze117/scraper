@@ -68,9 +68,9 @@ jobs:
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
 
-      # A wall below the cap (exit 42) ends the run red, like any other failure:
-      # with the cap in place it is no longer the normal end of a run. No
-      # re-dispatch -- the next of the crontab's four slots a day starts on a
-      # fresh runner with a fresh IP.
+      # A wall after at least one answered fetch ends the run green -- it is the
+      # ordinary end of most runs (WALL_AFTER_FETCHES_ENDS_GREEN). Only a wall
+      # before any answer exits 42 and ends red. No re-dispatch: the next
+      # two-hourly slot starts on a fresh runner with a fresh IP.
       - name: Run Immowelt Scraper
         run: python -m scrape.immowelt
