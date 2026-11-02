@@ -38,6 +38,11 @@ class ImmoweltScraper(BaseScraper):
     MAX_LISTINGS_PER_RUN = 150
     # So the ~30 wall is the ordinary end of most runs, and it ends them green.
     WALL_AFTER_FETCHES_ENDS_GREEN = True
+    # get_image_urls only returns no photos when og:image is present and empty;
+    # a moved gallery raises and counts as a parse failure. The streak added only
+    # false alarms: 289 photo-less prefab-house ads from one agency (2026-11-01)
+    # turned every run red for two days.
+    NO_IMAGE_STREAK_TO_ABORT = None
 
     def __init__(self):
         method = config.scrape.immowelt.method

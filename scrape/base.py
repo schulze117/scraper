@@ -98,8 +98,9 @@ class BaseScraper(ABC):
     # in blocks (ten prefab-house ads from one advertiser, immowelt 2026-09-26),
     # but the longest natural streak over 30 days was 9 on kleinanzeigen, 5 on
     # immowelt and 2 on immoscout (2026-09-27). Counted after the save, so the
-    # listings are kept and the next run moves past them.
-    NO_IMAGE_STREAK_TO_ABORT = 20
+    # listings are kept and the next run moves past them. None where the parser
+    # proves every empty gallery itself, so a streak says nothing more.
+    NO_IMAGE_STREAK_TO_ABORT: int | None = 20
 
     def __init__(self, source: ListingSource, method: str, proxy_url: str | None):
         self.source = source
@@ -349,7 +350,7 @@ class BaseScraper(ABC):
         with self._block_lock:
             self._consecutive_no_images = 0 if found else self._consecutive_no_images + 1
             n = self._consecutive_no_images
-        if n < self.NO_IMAGE_STREAK_TO_ABORT:
+        if self.NO_IMAGE_STREAK_TO_ABORT is None or n < self.NO_IMAGE_STREAK_TO_ABORT:
             return
         self.logger.error(
             f"{n} listings in a row had no photos — the portal has likely moved its "
