@@ -49,10 +49,10 @@ jobs:
       # Immoscout is fetched through the AI server (residential IP) to clear the
       # AWS WAF. The runner joins the tailnet and reaches the proxy privately at
       # 100.88.231.47:8888 (= PROXY_URL). The node is ephemeral, so it removes
-      # itself when the job ends — nothing accumulates. Skipped only for an
-      # explicit direct run.
+      # itself when the job ends — nothing accumulates.
+      # Always: the database is reachable only over Tailscale, so a direct
+      # run (use_proxy=false) needs the tailnet too -- it just leaves PROXY_URL unset.
       - name: Connect to Tailscale
-        if: ${{ inputs.use_proxy != 'false' }}
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}

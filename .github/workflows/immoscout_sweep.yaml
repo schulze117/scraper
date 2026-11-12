@@ -66,8 +66,9 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      # Always: the database is reachable only over Tailscale, so a direct
+      # run (use_proxy=false) needs the tailnet too -- it just leaves PROXY_URL unset.
       - name: Connect to Tailscale
-        if: ${{ inputs.use_proxy != 'false' }}
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}

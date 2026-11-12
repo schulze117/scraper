@@ -48,6 +48,17 @@ jobs:
           CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
         run: echo "$CONFIG_JSON_CONTENT" > config.json
 
+      # The database is reachable only over Tailscale (DATABASE__HOST is the
+      # VPS's tailnet address). This joins the tailnet without an exit node, so
+      # portal traffic still leaves from the runner's own IP.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gha-kleinanzeigen-scrape
+
       - name: Create .env file
         run: |
           touch .env
