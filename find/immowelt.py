@@ -44,11 +44,10 @@ class ImmoweltFinder(BaseFinder):
     # A page this full cannot be a one-page result set -- see get_pages_count.
     # The smaller of the two, so the check covers every category.
     FULL_PAGE_ENTRIES = 30
-    # The sweep starts direct and moves to the residential proxy at the first
-    # block. Direct from a runner DataDome walls it around page 40-50 of a
-    # category; the proxy walked all 174 pages without a block (2026-09-14). The
-    # pages before the wall are then pages the shared proxy does not carry.
-    PROXY_FALLBACK_IN_SWEEP = True
+    # No proxy fallback: immowelt blocks the home IP since 2026-11-18. The sweep
+    # is split over many runners instead, each slice short enough to finish
+    # before DataDome's wall -- see find/shards.py.
+    PROXY_FALLBACK_IN_SWEEP = False
 
     def __init__(self):
         method = config.find.immowelt.method

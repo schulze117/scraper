@@ -1,23 +1,24 @@
 name: Run Immowelt Sweep
 
-# The weekly last_seen_at sweep, NOT the finder that hunts for new listings.
-# See immoscout_sweep.yaml for why this exists; ../reconcile.py consumes it.
+# The last_seen_at sweep, NOT the finder that hunts for new listings. See
+# immoscout_sweep.yaml for why this exists; ../reconcile.py consumes it.
 #
 # Two groups, each swept three times a week by the VPS crontab (Mon/Wed/Fri,
-# Tue/Thu/Sat). The balanced split here falls on a different axis than
-# immoscout's: houses against flats, 178 vs 200 pages, because HAUS_KAUFEN alone
-# is 172 of the 378.
+# Tue/Thu/Sat): houses against flats.
 #
-# Depth is the whole point here and also the whole risk: from a GitHub runner IP
-# DataDome walls the sweep around page 40-50 of a category. The residential exit
-# does not hit that wall -- 174/174 pages, zero blocks, on run 34883536366
-# (2026-09-14) -- so the sweep starts direct and moves onto the proxy at its first
-# block (ImmoweltFinder.PROXY_FALLBACK_IN_SWEEP), retrying that page there. The
-# sweep_run row says where: `proxy after N direct pages`.
+# Split over many runners (find/shards.py). DataDome walls immowelt after
+# roughly 30-45 search pages per IP, and each job here gets a fresh runner IP, so
+# a slice of 15 pages finishes before any wall. The sweep used to fall back to
+# the home proxy at the wall instead, until immowelt blocked the home IP as well
+# (2026-11-18). Nothing here touches the proxy any more.
 #
-# A sweep that does get blocked deep costs the pages behind the block and nothing
-# else: it records complete=false and reconcile.py then does nothing for the
-# source at all, rather than deactivating what the crawl never reached.
+#   plan    opens the sweep_run row, reads page 1 of every category/location and
+#           cuts the rest into slices
+#   sweep   one job per slice, in parallel
+#   finish  closes the row: complete only if page 1 and every slice were read
+#
+# A sweep that misses anything records complete=false and reconcile.py then does
+# nothing for the source, rather than deactivating what the crawl never reached.
 on:
   workflow_dispatch:
     inputs:
@@ -25,11 +26,6 @@ on:
         description: 'Categories to sweep, comma-separated (WOHNUNG_KAUFEN, WOHNUNG_MIETEN, HAUS_KAUFEN, HAUS_MIETEN)'
         required: true
         type: string
-      use_proxy:
-        description: 'Start on the AI-server residential proxy instead of falling back to it at the first block'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -39,58 +35,149 @@ concurrency:
   group: immowelt-sweep
   cancel-in-progress: false
 
+env:
+  USE_PROXY: 'false'
+
 jobs:
-  run-script:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
-
-    # Tailscale and PROXY_URL are always set up, because the fallback needs them
-    # mid-run. The proxy is a shared resource: the same AI server carries immoscout
-    # find, scrape and sweep, and the crontab keeps them apart -- this sweep has the
-    # 06:00 slot. Check what else holds it before dispatching an off-schedule run --
-    # ../architektur.md#takt.
-    env:
-      USE_PROXY: ${{ inputs.use_proxy }}
-
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
+          pip install -r requirements.txt
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-          hostname: gha-immowelt-sweep
-
+          hostname: gha-immowelt-sweep-plan
       - name: Create config.json
         env:
           CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
         run: echo "$CONFIG_JSON_CONTENT" > config.json
-
       - name: Create .env file
         run: |
-          touch .env
           echo "DATABASE__USER=${{ secrets.DATABASE__USER }}" >> .env
           echo "DATABASE__HOST=${{ secrets.DATABASE__HOST }}" >> .env
           echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
-          echo "PROXY_URL=${{ secrets.PROXY_URL }}" >> .env
+      - name: Plan ${{ inputs.category }}
+        id: plan
+        run: |
+          python -m find.shards plan --portal immowelt --category "${{ inputs.category }}" --out plan.json
+          python -c "import json; p=json.load(open('plan.json')); print('matrix='+json.dumps(p['shards'],separators=(',',':'))); print('count=%d' % len(p['shards']))" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
 
-      # No retry-on-42 step. The finder never exits 42: a block moves the sweep
-      # onto the proxy, and a page that fails there too is a failed page and
-      # costs the sweep its `complete`.
-      - name: Sweep ${{ inputs.category }}
-        run: python -m find.immowelt --sweep --category "${{ inputs.category }}"
+  sweep:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      # Leaves room under GitHub's 20 concurrent jobs for the finders and
+      # scrapers of this repo.
+      max-parallel: 10
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gha-immowelt-sweep-${{ strategy.job-index }}
+      - name: Create config.json
+        env:
+          CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
+        run: echo "$CONFIG_JSON_CONTENT" > config.json
+      - name: Create .env file
+        run: |
+          echo "DATABASE__USER=${{ secrets.DATABASE__USER }}" >> .env
+          echo "DATABASE__HOST=${{ secrets.DATABASE__HOST }}" >> .env
+          echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
+          echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
+          echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
+      - name: Sweep ${{ matrix.category }}/${{ matrix.location }} pages ${{ matrix.first }}-${{ matrix.last }}
+        run: >
+          python -m find.shards shard --portal immowelt
+          --category ${{ matrix.category }} --location ${{ matrix.location }}
+          --first ${{ matrix.first }} --last ${{ matrix.last }}
+          ${{ matrix.open_end && '--open-end' || '' }}
+          --out result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slice-${{ strategy.job-index }}
+          path: result.json
+          if-no-files-found: ignore
+
+  finish:
+    needs: [plan, sweep]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gha-immowelt-sweep-finish
+      - name: Create config.json
+        env:
+          CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
+        run: echo "$CONFIG_JSON_CONTENT" > config.json
+      - name: Create .env file
+        run: |
+          echo "DATABASE__USER=${{ secrets.DATABASE__USER }}" >> .env
+          echo "DATABASE__HOST=${{ secrets.DATABASE__HOST }}" >> .env
+          echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
+          echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
+          echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+      - uses: actions/download-artifact@v4
+        # No slices at all when every category fits on page 1.
+        continue-on-error: true
+        with:
+          pattern: slice-*
+          path: results
+      - name: Close the sweep record
+        run: |
+          mkdir -p flat
+          i=0; for f in results/*/result.json; do [ -f "$f" ] && cp "$f" "flat/$((i++)).json"; done
+          python -m find.shards finish --plan plan.json --results flat --expected ${{ needs.plan.outputs.count }}
