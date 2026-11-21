@@ -180,4 +180,4 @@ jobs:
         run: |
           mkdir -p flat
           i=0; for f in results/*/result.json; do [ -f "$f" ] && cp "$f" "flat/$((i++)).json"; done
-          python -m find.shards finish --plan plan.json --results flat --expected ${{ needs.plan.outputs.count }}
+          python -m find.shards finish --plan plan.json --results flat

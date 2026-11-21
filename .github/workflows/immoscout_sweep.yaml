@@ -1,22 +1,32 @@
 name: Run Immoscout Sweep
 
-# The weekly last_seen_at sweep, NOT the finder that hunts for new listings.
+# The last_seen_at sweep, NOT the finder that hunts for new listings.
 #
 # The incremental finder (immoscout_find.yaml) stops after three pages with
 # nothing new, so it never reaches the older listings and never refreshes their
-# `system.last_seen_at`. This run crawls one category to its last page, which
-# refreshes the whole live inventory of that category. `reconcile.py` turns that
-# into `general.active`, by deactivating whatever a complete cycle did not see.
+# `system.last_seen_at`. This run crawls a group of categories to their last
+# page, which refreshes the whole live inventory of that group. `reconcile.py`
+# turns that into `general.active`, by deactivating whatever a complete cycle did
+# not see.
 #
-# Two groups, each swept three times a week by the VPS crontab (Mon/Wed/Fri,
-# Tue/Thu/Sat), so no listing's last_seen_at is ever more than two days stale.
-# The groups are sized to be about equal rather than to be tidy: WOHNUNG_MIETEN
-# alone is 524 of the 1123 pages, so it is the rent categories against the buy
-# ones — 544 vs 579 pages, measured 2026-09-14.
+# Two groups, rent and buy, each swept three times a week by the VPS crontab, so
+# no listing's last_seen_at is ever more than two days stale.
 #
-# Split at all because a full crawl of all five in one run is hours on the one
-# residential IP that clears the WAF, and because a blocked run then only costs
-# that group instead of the lot.
+# Cut into slices of ~100 pages (find/shards.py), ONE AT A TIME through the
+# residential proxy -- only the home IP clears the WAF, so there is no parallel
+# to be had. What the slices buy is a time limit per slice instead of one for the
+# whole group: the buy group outgrew a single job's limit when the search area
+# grew (714 pages, 2026-11-20), and a bigger area now means more slices, not a
+# killed run. The wall-clock of a group is still pages x ~26 s on the proxy.
+#
+#   plan    opens the sweep_run row, reads page 1 of every category/location and
+#           cuts the rest into slices
+#   sweep   one job per slice, sequential and in plan order
+#   finish  closes the row: complete only if page 1 and every slice up to the
+#           undated tail were read
+#
+# A sweep that misses anything records complete=false and reconcile.py then does
+# nothing for the source, rather than deactivating what the crawl never reached.
 on:
   workflow_dispatch:
     inputs:
@@ -42,54 +52,155 @@ concurrency:
   group: immoscout-sweep
   cancel-in-progress: false
 
+env:
+  USE_PROXY: ${{ inputs.use_proxy }}
+
 jobs:
-  run-script:
+  plan:
     runs-on: ubuntu-latest
-    # ~453 pages at ~30 s is close to 4 h. Fail on our own clock rather than be
-    # killed at GitHub's 6 h with no explanation.
-    timeout-minutes: 330
-
-    env:
-      USE_PROXY: ${{ inputs.use_proxy }}
-
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
+          pip install -r requirements.txt
       # Always: the database is reachable only over Tailscale, so a direct
-      # run (use_proxy=false) needs the tailnet too -- it just leaves PROXY_URL unset.
+      # run (use_proxy=false) needs the tailnet too -- it just leaves the proxy off.
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-          hostname: gha-immoscout-sweep
-
+          hostname: gha-immoscout-sweep-plan
       - name: Create config.json
         env:
           CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
         run: echo "$CONFIG_JSON_CONTENT" > config.json
-
       - name: Create .env file
         run: |
-          touch .env
           echo "DATABASE__USER=${{ secrets.DATABASE__USER }}" >> .env
           echo "DATABASE__HOST=${{ secrets.DATABASE__HOST }}" >> .env
           echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
           echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
           echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
           echo "PROXY_URL=${{ secrets.PROXY_URL }}" >> .env
+      - name: Plan ${{ inputs.category }}
+        id: plan
+        run: |
+          python -m find.shards plan --portal immoscout --category "${{ inputs.category }}" --out plan.json
+          python -c "import json; p=json.load(open('plan.json')); print('matrix='+json.dumps(p['shards'],separators=(',',':'))); print('count=%d' % len(p['shards']))" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
 
-      - name: Sweep ${{ inputs.category }}
-        run: python -m find.immoscout --sweep --category "${{ inputs.category }}"
+  sweep:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    # ~100 pages at ~26 s is under an hour; the rest is room for stalled
+    # fetches, which cost up to three minutes each.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # One IP clears the WAF, and find, scrape and sweep queue for it. Matrix
+      # jobs start in list order, so pages are still walked front to back.
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gha-immoscout-sweep-${{ strategy.job-index }}
+      - name: Create config.json
+        env:
+          CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
+        run: echo "$CONFIG_JSON_CONTENT" > config.json
+      - name: Create .env file
+        run: |
+          echo "DATABASE__USER=${{ secrets.DATABASE__USER }}" >> .env
+          echo "DATABASE__HOST=${{ secrets.DATABASE__HOST }}" >> .env
+          echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
+          echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
+          echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
+          echo "PROXY_URL=${{ secrets.PROXY_URL }}" >> .env
+      - name: Sweep ${{ matrix.category }}/${{ matrix.location }} pages ${{ matrix.first }}-${{ matrix.last }}
+        run: >
+          python -m find.shards shard --portal immoscout
+          --category ${{ matrix.category }} --location ${{ matrix.location }}
+          --first ${{ matrix.first }} --last ${{ matrix.last }}
+          ${{ matrix.open_end && '--open-end' || '' }}
+          --out result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slice-${{ strategy.job-index }}
+          path: result.json
+          if-no-files-found: ignore
+
+  finish:
+    needs: [plan, sweep]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gha-immoscout-sweep-finish
+      - name: Create config.json
+        env:
+          CONFIG_JSON_CONTENT: ${{ vars.CONFIG_FILE }}
+        run: echo "$CONFIG_JSON_CONTENT" > config.json
+      - name: Create .env file
+        run: |
+          echo "DATABASE__USER=${{ secrets.DATABASE__USER }}" >> .env
+          echo "DATABASE__HOST=${{ secrets.DATABASE__HOST }}" >> .env
+          echo "DATABASE__NAME=${{ secrets.DATABASE__NAME }}" >> .env
+          echo "DATABASE__PASSWORD=${{ secrets.DATABASE__PASSWORD }}" >> .env
+          echo "DATABASE__PORT=${{ secrets.DATABASE__PORT }}" >> .env
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+      - uses: actions/download-artifact@v4
+        # No slices at all when every category fits on page 1.
+        continue-on-error: true
+        with:
+          pattern: slice-*
+          path: results
+      - name: Close the sweep record
+        run: |
+          mkdir -p flat
+          i=0; for f in results/*/result.json; do [ -f "$f" ] && cp "$f" "flat/$((i++)).json"; done
+          python -m find.shards finish --plan plan.json --results flat
