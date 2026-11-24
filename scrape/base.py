@@ -242,9 +242,7 @@ class BaseScraper(ABC):
             extra_data = self.get_extra_data(soup, json_data)
 
             self.db.set_raw_data(listing.id, minified_html, json_data)
-            self.db.set_image_urls(listing.id, image_urls)
-            if main_image_url:
-                self.db.set_main_image_url(listing.id, main_image_url)
+            self.db.set_images(listing.id, image_urls, main_image_url)
             if extra_data:
                 self.db.update_extra_data(listing.id, extra_data)
             self.db.set_last_scraped(listing.id)

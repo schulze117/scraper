@@ -210,6 +210,31 @@ SET_MAIN_IMAGE_URL_SQL: Composed = SQL(
     updates=SQL("{0} = EXCLUDED.{0}").format(Identifier("is_main")),
 )
 
+# `is_main` is TRUE or NULL, never FALSE — the readers sort on it that way.
+CLEAR_OTHER_MAIN_IMAGES_SQL = SQL(
+    """
+    UPDATE fixnflip_v2.images SET is_main = NULL
+    WHERE property_id = %(property_id)s AND is_main AND url <> %(url)s
+    """
+)
+
+# A photo the listing no longer shows goes, and if its bytes are in S3 the id is
+# queued for image-downloader, which holds the S3 keys. Without this, portals
+# that re-issue image URLs (kleinanzeigen does on every scrape) pile up a full
+# set of photos per scrape.
+PRUNE_IMAGES_SQL = SQL(
+    """
+    WITH gone AS (
+        DELETE FROM fixnflip_v2.images
+        WHERE property_id = %(property_id)s AND url <> ALL(%(urls)s)
+        RETURNING image_id, downloaded
+    )
+    INSERT INTO fixnflip_v2.image_deletion (image_id)
+    SELECT image_id FROM gone WHERE downloaded IS TRUE
+    ON CONFLICT DO NOTHING
+    """
+)
+
 SET_LAST_SCRAPED_SQL: Composed = SQL(
     "UPDATE {schema}.{table} SET {field} = now() WHERE {where_field} = {where_value}"
 ).format(
@@ -474,25 +499,33 @@ class Database:
             self.logger.debug(f"Raw data set for {uuid}")
 
     @db_operation_with_retry
-    def set_image_urls(self, uuid: UUID, image_urls: list[str]) -> None:
+    def set_images(self, uuid: UUID, image_urls: list[str], main_image_url: str | None) -> int:
+        """Make `images` hold exactly the photos this scrape saw.
+
+        Returns how many removed photos were queued for deletion from S3.
+
+        One transaction, so a reader never sees the listing without photos. An
+        empty scrape prunes nothing: a gallery that failed to parse must not wipe
+        the photos a listing already has.
+        """
+        current = list(dict.fromkeys(image_urls + ([main_image_url] if main_image_url else [])))
         with self._db() as (connection, cursor):
-            self.logger.debug(f"Setting image URLs for {uuid}")
             cursor.executemany(
                 SET_IMAGE_URLS_SQL, [{"property_id": uuid, "url": url} for url in image_urls]
             )
+            if main_image_url:
+                cursor.execute(
+                    SET_MAIN_IMAGE_URL_SQL,
+                    {"property_id": uuid, "url": main_image_url, "is_main": True},
+                )
+                cursor.execute(CLEAR_OTHER_MAIN_IMAGES_SQL, {"property_id": uuid, "url": main_image_url})
+            pruned = 0
+            if current:
+                cursor.execute(PRUNE_IMAGES_SQL, {"property_id": uuid, "urls": current})
+                pruned = cursor.rowcount  # rows queued for S3, not rows deleted
             connection.commit()
-            self.logger.debug(f"Setting image URLs set for {uuid}")
-
-    @db_operation_with_retry
-    def set_main_image_url(self, uuid: UUID, image_url: str) -> None:
-        with self._db() as (connection, cursor):
-            self.logger.debug(f"Setting main image URL for {uuid}")
-            cursor.execute(
-                SET_MAIN_IMAGE_URL_SQL,
-                {"property_id": uuid, "url": image_url, "is_main": True},
-            )
-            connection.commit()
-            self.logger.debug(f"Main image URL set for {uuid}")
+            self.logger.debug(f"Images set for {uuid}: {len(current)} current, {pruned} queued for deletion")
+            return pruned
 
     @db_operation_with_retry
     def set_last_scraped(self, uuid: UUID) -> None:
